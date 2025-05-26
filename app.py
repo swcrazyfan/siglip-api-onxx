@@ -19,10 +19,8 @@ import re
 from pathlib import Path
 from functools import lru_cache
 import asyncio
-import time # Add this
 from contextlib import asynccontextmanager
 import json
-import uuid # Added for generating unique IDs
 
 # Configure logging
 logging.basicConfig(
@@ -32,17 +30,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Global variables for models
+_model_load_lock = asyncio.Lock()  # Lock for synchronizing model loading
 vision_session = None
 text_session = None
 processor = None
 tokenizer = None
 logit_scale = 100.0  # SigLIP's temperature parameter
-last_model_access_time = None
-model_lock = asyncio.Lock() # For thread-safe model loading/unloading
-model_management_task = None # To hold the background task
 
 # Model configuration
-MODEL_IDLE_TIMEOUT_SECONDS = 300  # Unload models after 5 minutes of inactivity
 MODEL_NAME = "pulsejet/siglip-base-patch16-256-multilingual-onnx"
 MAX_TEXT_TOKENS = 64
 IMAGE_SIZE = 256
@@ -63,23 +58,17 @@ class EmbeddingResponse(BaseModel):
     usage: Dict[str, int]
 
 
-class RerankRequest(BaseModel):
-    """Request model for reranking documents based on a query."""
+class RankRequest(BaseModel):
+    """Request model for ranking/similarity"""
     model: str = Field(default="siglip-base-patch16-256-multilingual")
-    query: str = Field(..., description="The search query string.")
-    documents: List[str] = Field(..., description="A list of documents to rerank.")
-    top_n: Optional[int] = Field(None, description="The number of most relevant documents to return. If not specified, all documents are returned.")
-    return_documents: Optional[bool] = Field(False, description="Whether to return the document content in the response.")
+    query: Union[str, List[str]] = Field(..., description="Query text or image(s)")
+    candidates: List[str] = Field(..., description="Candidates to rank")
+    return_scores: Optional[bool] = Field(default=True, description="Return similarity scores")
 
-class RerankResult(BaseModel):
-    index: int = Field(..., description="The original index of the document in the input list.")
-    relevance_score: float = Field(..., description="The relevance score of the document to the query.")
-    document: Optional[str] = Field(None, description="The document content, if requested.")
 
-class RerankResponse(BaseModel):
-    """Response model for reranking results."""
-    id: Optional[str] = "rerank-1" # Placeholder ID
-    results: List[RerankResult]
+class RankResponse(BaseModel):
+    """Response model for ranking results"""
+    results: List[Dict[str, Any]]
     model: str
     usage: Dict[str, int]
 
@@ -91,73 +80,14 @@ class ClassifyRequest(BaseModel):
     model: str = Field(default="siglip-base-patch16-256-multilingual")
 
 
-async def _manage_model_lifecycle():
-    """Periodically checks if models should be unloaded due to inactivity."""
-    global last_model_access_time, model_lock
-    logger.info("Starting model lifecycle management task.")
-    try:
-        while True:
-            await asyncio.sleep(60) # Check every 60 seconds
-            async with model_lock: # Ensure exclusive access for checking/unloading
-                if vision_session is not None and last_model_access_time is not None:
-                    idle_time = time.time() - last_model_access_time
-                    if idle_time > MODEL_IDLE_TIMEOUT_SECONDS:
-                        logger.info(f"Models idle for {idle_time:.0f}s, exceeding timeout of {MODEL_IDLE_TIMEOUT_SECONDS}s.")
-                        # Direct unloading logic to avoid re-locking:
-                        logger.info("Unloading models due to inactivity (from lifecycle manager)...")
-                        global vision_session, text_session, processor, tokenizer # Ensure these are accessible
-                        vision_session = None
-                        text_session = None
-                        processor = None
-                        tokenizer = None
-                        last_model_access_time = None
-                        logger.info("Models unloaded (from lifecycle manager).")
-                    else:
-                        logger.debug(f"Models active. Idle time: {idle_time:.0f}s.")
-                elif vision_session is None:
-                    logger.debug("Models are currently not loaded. No action needed by lifecycle manager.")
-
-    except asyncio.CancelledError:
-        logger.info("Model lifecycle management task cancelled.")
-    except Exception as e:
-        logger.error(f"Error in model lifecycle management task: {e}", exc_info=True)
-    finally:
-        logger.info("Model lifecycle management task finished.")
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle, including model loading and background task."""
-    global model_management_task
-    
+    """Manage application lifecycle"""
     # Startup
-    logger.info("Application startup...")
-    # Initial load can be deferred to first request by not calling load_models() here,
-    # or load them now to make the first request faster.
-    # For now, let's keep initial load to ensure health check passes if it depends on models.
-    # If health check doesn't need models immediately, this can be removed.
     await load_models()
-    
-    # Start the background task
-    model_management_task = asyncio.create_task(_manage_model_lifecycle())
-    
     yield
-    
     # Shutdown
-    logger.info("Application shutting down...")
-    if model_management_task:
-        logger.info("Cancelling model lifecycle management task...")
-        model_management_task.cancel()
-        try:
-            await model_management_task
-        except asyncio.CancelledError:
-            logger.info("Model lifecycle management task successfully cancelled on shutdown.")
-        except Exception as e: # Log any other exceptions during task shutdown
-            logger.error(f"Exception during model management task shutdown: {e}", exc_info=True)
-
-    # Ensure models are unloaded on shutdown, regardless of timeout
-    logger.info("Ensuring models are unloaded on final shutdown...")
-    await unload_models() # This uses its own lock, should be fine.
-    logger.info("Application shutdown complete.")
+    logger.info("Shutting down...")
 
 
 # Create FastAPI app
@@ -178,59 +108,32 @@ app.add_middleware(
 )
 
 
-async def unload_models():
-    """Unload models and free up memory."""
-    global vision_session, text_session, processor, tokenizer, last_model_access_time
-    async with model_lock:
-        if vision_session is not None:
-            logger.info("Unloading models due to inactivity...")
-            vision_session = None
-            text_session = None
-            processor = None
-            tokenizer = None
-            last_model_access_time = None # Reset access time
-            # Python's garbage collector should handle the rest,
-            # but for ONNX Runtime, sessions might hold resources.
-            # Explicitly deleting might help, but usually None is enough.
-            # import gc
-            # gc.collect() # Optionally force garbage collection
-            logger.info("Models unloaded.")
-        else:
-            logger.debug("Models already unloaded or not loaded yet.")
-
-
 async def load_models():
-    """Load ONNX models and processors if not already loaded."""
-    global vision_session, text_session, processor, tokenizer, last_model_access_time
+    """Load ONNX models and processors"""
+    global vision_session, text_session, processor, tokenizer
     
-    # Check if models are already loaded (not strictly necessary with the lock outside, but good practice)
-    if vision_session is not None and text_session is not None and processor is not None and tokenizer is not None:
-        logger.debug("Models are already loaded.")
-        # Update access time even if just checking
-        async with model_lock: # Ensure thread-safe update of last_model_access_time
-            last_model_access_time = time.time()
-        return
-
-    async with model_lock:
-        # Double-check inside the lock in case another coroutine loaded them while waiting
-        if vision_session is not None and text_session is not None and processor is not None and tokenizer is not None:
-            logger.debug("Models were loaded by another coroutine while waiting for lock.")
-            last_model_access_time = time.time()
+    async with _model_load_lock:  # Ensure only one coroutine loads models at a time
+        # Check if models are already loaded after acquiring the lock
+        if all(component is not None for component in [vision_session, text_session, processor, tokenizer]):
+            logger.debug("Models already loaded by another coroutine")
             return
-
+            
         logger.info("Loading SigLIP ONNX models...")
         
         try:
             from huggingface_hub import hf_hub_download
             
+            # Download ONNX model
             vision_model_path = hf_hub_download(
                 repo_id=MODEL_NAME,
                 filename="onnx/model_quantized.onnx"
             )
             
+            # Create ONNX Runtime session
             session_options = ort.SessionOptions()
             session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
             
+            # Detect available providers
             available_providers = ort.get_available_providers()
             providers = []
             if 'CUDAExecutionProvider' in available_providers:
@@ -238,48 +141,31 @@ async def load_models():
                 logger.info("Using CUDA for acceleration")
             providers.append('CPUExecutionProvider')
             
-            current_vision_session = ort.InferenceSession(vision_model_path, session_options, providers=providers)
-            current_text_session = current_vision_session # SigLIP uses shared architecture
-            current_processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-256-multilingual")
-            current_tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-256-multilingual")
-
-            # Assign to global variables only after all are successfully loaded
-            vision_session = current_vision_session
-            text_session = current_text_session
-            processor = current_processor
-            tokenizer = current_tokenizer
+            vision_session = ort.InferenceSession(vision_model_path, session_options, providers=providers)
             
-            last_model_access_time = time.time()
-            logger.info("Models loaded successfully.")
+            # For text, we'll use the same model (SigLIP uses shared architecture)
+            text_session = vision_session
+            
+            # Load processor and tokenizer
+            processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-256-multilingual")
+            tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-256-multilingual")
+            
+            logger.info("Models loaded successfully")
             
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
-            # Reset any partially loaded models to ensure clean state
-            vision_session = None
-            text_session = None
-            processor = None
-            tokenizer = None
             raise
 
 
 async def ensure_models_loaded():
-    """Ensures models are loaded before use, and updates access time."""
-    global last_model_access_time, vision_session, model_lock
+    """Ensure all required model components are loaded"""
+    global vision_session, text_session, processor, tokenizer
     
-    # Quick check without lock
-    if vision_session is not None:
-        async with model_lock: # Lock for updating shared access time
-            last_model_access_time = time.time()
-            logger.debug("Models confirmed loaded, access time updated.")
-        return
-
-    # If not loaded, call load_models which handles locking internally
-    logger.debug("Models not loaded, attempting to load.")
-    await load_models() # load_models will set last_model_access_time on successful load
-    
-    if vision_session is None: # Verify loading was successful
-        logger.error("Critical: ensure_models_loaded called load_models, but models are still None.")
-        raise RuntimeError("Failed to ensure models are loaded. Models are still None after load attempt.")
+    if any(component is None for component in [vision_session, text_session, processor, tokenizer]):
+        logger.info("One or more model components not loaded, initializing...")
+        await load_models()
+    else:
+        logger.debug("All model components already loaded")
 
 
 def detect_input_type(input_str: str) -> str:
@@ -381,9 +267,25 @@ def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     return embeddings / (norm + 1e-12)
 
 
+async def get_embedding(input_str: str) -> tuple[np.ndarray, dict]:
+    """Get embedding for any input type"""
+    await ensure_models_loaded()
+    
+    input_type = detect_input_type(input_str)
+    
+    if input_type in ['url', 'base64', 'file']:
+        try:
+            return await get_image_embedding(input_str)
+        except Exception as e:
+            logger.warning(f"Failed to process as image: {e}, falling back to text")
+            return await get_text_embedding(input_str)
+    else:
+        return await get_text_embedding(input_str)
+
+
 async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.ndarray, dict]:
     """Get embedding for an image with metadata"""
-    await ensure_models_loaded() # Ensure models are ready and access time updated
+    await ensure_models_loaded()
     
     if isinstance(image_input, str):
         image = await load_image_from_input(image_input)
@@ -394,50 +296,22 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     image_inputs = processor(images=image, return_tensors="np")
     
     # Run inference
-    input_feed = {}
-    model_input_names = [inp.name for inp in vision_session.get_inputs()]
-
-    if "pixel_values" in model_input_names:
-        input_feed["pixel_values"] = image_inputs['pixel_values']
-    # If dummy text inputs were needed for image processing, they'd be added here.
-    # Assuming they are not for now, as the error was on the text path.
-    
     outputs = await asyncio.to_thread(
         vision_session.run,
         None,
-        input_feed
+        {vision_session.get_inputs()[0].name: image_inputs['pixel_values']}
     )
     
-    # Extract the image embedding
-    output_names = [o.name for o in vision_session.get_outputs()]
-    image_embedding = None
-    possible_image_embed_names = ["image_embeds", "image_embeddings", "image_features", "vision_embeds"]
-
-    found_image_embed_name = None
-    for name in possible_image_embed_names:
-        if name in output_names:
-            found_image_embed_name = name
-            break
+    # Extract and normalize embedding
+    embedding = outputs[0].squeeze()  # Adjust index based on model output
+    embedding = normalize_embeddings(embedding).squeeze()
     
-    if found_image_embed_name:
-        image_embed_index = output_names.index(found_image_embed_name)
-        image_embedding = outputs[image_embed_index].squeeze()
-        logger.debug(f"Extracted image embedding from output: {found_image_embed_name}")
-    elif len(outputs) > 0:
-        # Default to the first output if not clearly identified
-        image_embedding = outputs[0].squeeze()
-        logger.debug(f"Defaulting to output index 0 for image embedding (total outputs: {len(outputs)})")
-    else:
-        raise ValueError("ONNX model did not return any outputs for image embedding.")
-
-    image_embedding = normalize_embeddings(image_embedding).squeeze()
-    
-    return image_embedding, {"input_type": "image", "truncated": False}
+    return embedding, {"input_type": "image", "truncated": False}
 
 
 async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[np.ndarray, dict]:
     """Get embedding for text with truncation warning"""
-    await ensure_models_loaded() # Ensure models are ready and access time updated
+    await ensure_models_loaded()
     
     metadata = {"input_type": "text", "truncated": False}
     
@@ -466,68 +340,21 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
         max_length=MAX_TEXT_TOKENS
     )
     
-    # Prepare dummy pixel_values for text embedding, as the model seems to require them
-    dummy_pixel_values = np.zeros((1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
-
+    # Run inference
     input_feed = {}
-    model_input_names = [inp.name for inp in text_session.get_inputs()]
-
-    if "input_ids" in model_input_names:
-        input_feed["input_ids"] = text_inputs['input_ids']
-    if "attention_mask" in model_input_names:
-        input_feed["attention_mask"] = text_inputs['attention_mask']
+    for i, input_name in enumerate(text_session.get_inputs()):
+        if input_name.name == "input_ids":
+            input_feed[input_name.name] = text_inputs['input_ids']
+        elif input_name.name == "attention_mask":
+            input_feed[input_name.name] = text_inputs['attention_mask']
     
-    # Add dummy pixel_values if the model expects an input named "pixel_values"
-    if "pixel_values" in model_input_names:
-        input_feed["pixel_values"] = dummy_pixel_values
-    else:
-        # This case might indicate "pixel_values" is required but named differently.
-        # The error message implies the name is indeed "pixel_values".
-        logger.warning("ONNX model does not list 'pixel_values' as an input, but error indicated it was missing.")
-
     outputs = await asyncio.to_thread(text_session.run, None, input_feed)
     
-    # Extract the text embedding
-    output_names = [o.name for o in text_session.get_outputs()]
-    text_embedding = None
-    possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
+    # Extract and normalize embedding
+    embedding = outputs[0].squeeze()  # Adjust based on model output
+    embedding = normalize_embeddings(embedding).squeeze()
     
-    found_text_embed_name = None
-    for name in possible_text_embed_names:
-        if name in output_names:
-            found_text_embed_name = name
-            break
-            
-    if found_text_embed_name:
-        text_embed_index = output_names.index(found_text_embed_name)
-        text_embedding = outputs[text_embed_index].squeeze()
-        logger.debug(f"Extracted text embedding from output: {found_text_embed_name}")
-    elif len(outputs) >= 2: # If two outputs, assume [image_embeds, text_embeds] or similar order
-        text_embedding = outputs[1].squeeze()
-        logger.debug(f"Assuming text embedding is at output index 1 (total outputs: {len(outputs)})")
-    elif len(outputs) == 1: # If only one output, assume it's the text embedding in this context
-        text_embedding = outputs[0].squeeze()
-        logger.debug(f"Defaulting to output index 0 for text embedding (total outputs: {len(outputs)})")
-    else:
-        raise ValueError("ONNX model did not return any outputs for text embedding.")
-
-    text_embedding = normalize_embeddings(text_embedding).squeeze()
-    
-    return text_embedding, metadata
-
-
-async def get_embedding(input_str: str) -> tuple[np.ndarray, dict]:
-    """Get embedding for any input type"""
-    input_type = detect_input_type(input_str)
-    
-    if input_type in ['url', 'base64', 'file']:
-        try:
-            return await get_image_embedding(input_str)
-        except Exception as e:
-            logger.warning(f"Failed to process as image: {e}, falling back to text")
-            return await get_text_embedding(input_str)
-    else:
-        return await get_text_embedding(input_str)
+    return embedding, metadata
 
 
 @app.post("/v1/embeddings", response_model=EmbeddingResponse)
@@ -640,112 +467,94 @@ async def create_embeddings_with_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/rerank", response_model=RerankResponse) # Changed endpoint name and response model
-async def rerank_documents(request: RerankRequest): # Changed function name and request model
-    """Rerank documents based on their relevance to a query."""
+@app.post("/v1/rank", response_model=RankResponse)
+async def rank_candidates(request: RankRequest):
+    """Rank candidates by similarity to query"""
     try:
-        # Get query embedding
-        query_embedding, _ = await get_embedding(request.query)
-        query_embedding = query_embedding.reshape(1, -1) # Ensure it's a row vector
-
-        # Get document embeddings
-        document_embeddings_list = []
-        for doc_text in request.documents:
-            embedding, _ = await get_embedding(doc_text)
-            document_embeddings_list.append(embedding)
+        # Get query embeddings
+        queries = [request.query] if isinstance(request.query, str) else request.query
+        query_embeddings = []
         
-        if not document_embeddings_list:
-            return RerankResponse(
-                id=f"rerank-{str(uuid.uuid4())}", # Generate a UUID
-                results=[],
-                model=request.model,
-                usage={"prompt_tokens": 1, "total_tokens": 1} # Query token + 0 doc tokens
-            )
-
-        document_embeddings = np.array(document_embeddings_list)
+        for q in queries:
+            embedding, _ = await get_embedding(q)
+            query_embeddings.append(embedding)
         
-        # Compute cosine similarities (query_embedding vs all document_embeddings)
-        # query_embedding: (1, D), document_embeddings: (N, D)
-        # Resulting similarities: (1, N)
-        similarities = np.dot(query_embedding, document_embeddings.T).squeeze() # Squeeze to (N,)
+        query_embeddings = np.array(query_embeddings)
         
-        # Using raw similarities as relevance_score.
-        # SigLIP embeddings are already normalized, so dot product is cosine similarity.
-        # The logit_scale and sigmoid were for converting to probabilities,
-        # but for reranking, direct similarity scores are often preferred.
-        relevance_scores = similarities
-
+        # Get candidate embeddings
+        candidate_embeddings = []
+        for c in request.candidates:
+            embedding, _ = await get_embedding(c)
+            candidate_embeddings.append(embedding)
+        
+        candidate_embeddings = np.array(candidate_embeddings)
+        
+        # Compute cosine similarities
+        similarities = np.dot(query_embeddings, candidate_embeddings.T)
+        
+        # Apply temperature scaling
+        scaled_similarities = logit_scale * similarities
+        
+        # Compute probabilities using sigmoid
+        probabilities = 1 / (1 + np.exp(-scaled_similarities))
+        
         # Format results
-        results_with_scores = []
-        for i, doc_text in enumerate(request.documents):
-            result_item = RerankResult(
-                index=i,
-                relevance_score=float(relevance_scores[i]),
-                document=doc_text if request.return_documents else None
-            )
-            results_with_scores.append(result_item)
+        results = []
+        for i, query in enumerate(queries):
+            query_results = []
+            for j, candidate in enumerate(request.candidates):
+                result = {
+                    "candidate": candidate,
+                    "score": float(probabilities[i, j]),
+                    "similarity": float(similarities[i, j])
+                }
+                query_results.append(result)
             
-        # Sort by relevance_score in descending order
-        results_with_scores.sort(key=lambda x: x.relevance_score, reverse=True)
+            # Sort by score
+            query_results.sort(key=lambda x: x['score'], reverse=True)
+            
+            results.append({
+                "query": query,
+                "rankings": query_results
+            })
         
-        # Apply top_n if specified
-        if request.top_n is not None and request.top_n > 0:
-            results_with_scores = results_with_scores[:request.top_n]
-        
-        # Calculate token usage (approximate)
-        # For simplicity, count 1 for query and 1 for each document.
-        # A more accurate count would involve tokenizing, but this is often sufficient for usage stats.
-        prompt_tokens = 1 + len(request.documents)
-        
-        return RerankResponse(
-            id=f"rerank-{str(uuid.uuid4())}", # Generate a UUID
-            results=results_with_scores,
+        return RankResponse(
+            results=results,
             model=request.model,
             usage={
-                "prompt_tokens": prompt_tokens,
-                "total_tokens": prompt_tokens
+                "prompt_tokens": len(queries) + len(request.candidates),
+                "total_tokens": len(queries) + len(request.candidates)
             }
         )
         
     except Exception as e:
-        logger.error(f"Error in rerank_documents: {str(e)}")
+        logger.error(f"Error in rank_candidates: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/classify")
 async def classify_image(request: ClassifyRequest):
     """Zero-shot image classification"""
-    # Adapt to use the new RerankRequest structure
-    rerank_request_payload = {
-        "model": request.model,
-        "query": request.image,  # Image acts as the query
-        "documents": request.labels,  # Labels act as documents
-        "top_n": len(request.labels), # Return all scores for classification
-        "return_documents": True  # We need the labels back
-    }
-    rerank_request_obj = RerankRequest(**rerank_request_payload)
+    rank_request = RankRequest(
+        model=request.model,
+        query=request.image,
+        candidates=request.labels
+    )
     
-    try:
-        rerank_response = await rerank_documents(rerank_request_obj)
-    except Exception as e:
-        logger.error(f"Error calling rerank_documents from classify_image: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
-
+    rank_response = await rank_candidates(rank_request)
+    
     # Simplify response for classification
     classifications = []
-    for result in rerank_response.results:
+    for result in rank_response.results[0]["rankings"]:
         classifications.append({
-            "label": result.document,  # Assuming document is the label text
-            "score": result.relevance_score # Using relevance_score directly
+            "label": result["candidate"],
+            "score": result["score"]
         })
-    
-    # The rerank_response.results are already sorted by relevance_score
     
     return {
         "image": request.image,
         "classifications": classifications,
-        "model": request.model,
-        "usage": rerank_response.usage # Pass through usage stats
+        "model": request.model
     }
 
 
@@ -850,7 +659,7 @@ async def root():
             "/v1/models": "List available models (OpenAI compatible)",
             "/v1/embeddings": "Generate embeddings (OpenAI compatible)",
             "/v1/embeddings/image": "Generate embeddings with file upload",
-            "/v1/rerank": "Rerank documents based on query relevance",
+            "/v1/rank": "Rank candidates by similarity",
             "/v1/classify": "Zero-shot image classification",
             "/v1/classify/image": "Zero-shot classification with file upload",
             "/health": "Health check",
