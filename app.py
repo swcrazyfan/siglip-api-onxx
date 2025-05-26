@@ -260,17 +260,45 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     image_inputs = processor(images=image, return_tensors="np")
     
     # Run inference
+    input_feed = {}
+    model_input_names = [inp.name for inp in vision_session.get_inputs()]
+
+    if "pixel_values" in model_input_names:
+        input_feed["pixel_values"] = image_inputs['pixel_values']
+    # If dummy text inputs were needed for image processing, they'd be added here.
+    # Assuming they are not for now, as the error was on the text path.
+    
     outputs = await asyncio.to_thread(
         vision_session.run,
         None,
-        {vision_session.get_inputs()[0].name: image_inputs['pixel_values']}
+        input_feed
     )
     
-    # Extract and normalize embedding
-    embedding = outputs[0].squeeze()  # Adjust index based on model output
-    embedding = normalize_embeddings(embedding).squeeze()
+    # Extract the image embedding
+    output_names = [o.name for o in vision_session.get_outputs()]
+    image_embedding = None
+    possible_image_embed_names = ["image_embeds", "image_embeddings", "image_features", "vision_embeds"]
+
+    found_image_embed_name = None
+    for name in possible_image_embed_names:
+        if name in output_names:
+            found_image_embed_name = name
+            break
     
-    return embedding, {"input_type": "image", "truncated": False}
+    if found_image_embed_name:
+        image_embed_index = output_names.index(found_image_embed_name)
+        image_embedding = outputs[image_embed_index].squeeze()
+        logger.debug(f"Extracted image embedding from output: {found_image_embed_name}")
+    elif len(outputs) > 0:
+        # Default to the first output if not clearly identified
+        image_embedding = outputs[0].squeeze()
+        logger.debug(f"Defaulting to output index 0 for image embedding (total outputs: {len(outputs)})")
+    else:
+        raise ValueError("ONNX model did not return any outputs for image embedding.")
+
+    image_embedding = normalize_embeddings(image_embedding).squeeze()
+    
+    return image_embedding, {"input_type": "image", "truncated": False}
 
 
 async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[np.ndarray, dict]:
@@ -302,21 +330,54 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
         max_length=MAX_TEXT_TOKENS
     )
     
-    # Run inference
+    # Prepare dummy pixel_values for text embedding, as the model seems to require them
+    dummy_pixel_values = np.zeros((1, 3, IMAGE_SIZE, IMAGE_SIZE), dtype=np.float32)
+
     input_feed = {}
-    for i, input_name in enumerate(text_session.get_inputs()):
-        if input_name.name == "input_ids":
-            input_feed[input_name.name] = text_inputs['input_ids']
-        elif input_name.name == "attention_mask":
-            input_feed[input_name.name] = text_inputs['attention_mask']
+    model_input_names = [inp.name for inp in text_session.get_inputs()]
+
+    if "input_ids" in model_input_names:
+        input_feed["input_ids"] = text_inputs['input_ids']
+    if "attention_mask" in model_input_names:
+        input_feed["attention_mask"] = text_inputs['attention_mask']
     
+    # Add dummy pixel_values if the model expects an input named "pixel_values"
+    if "pixel_values" in model_input_names:
+        input_feed["pixel_values"] = dummy_pixel_values
+    else:
+        # This case might indicate "pixel_values" is required but named differently.
+        # The error message implies the name is indeed "pixel_values".
+        logger.warning("ONNX model does not list 'pixel_values' as an input, but error indicated it was missing.")
+
     outputs = await asyncio.to_thread(text_session.run, None, input_feed)
     
-    # Extract and normalize embedding
-    embedding = outputs[0].squeeze()  # Adjust based on model output
-    embedding = normalize_embeddings(embedding).squeeze()
+    # Extract the text embedding
+    output_names = [o.name for o in text_session.get_outputs()]
+    text_embedding = None
+    possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
     
-    return embedding, metadata
+    found_text_embed_name = None
+    for name in possible_text_embed_names:
+        if name in output_names:
+            found_text_embed_name = name
+            break
+            
+    if found_text_embed_name:
+        text_embed_index = output_names.index(found_text_embed_name)
+        text_embedding = outputs[text_embed_index].squeeze()
+        logger.debug(f"Extracted text embedding from output: {found_text_embed_name}")
+    elif len(outputs) >= 2: # If two outputs, assume [image_embeds, text_embeds] or similar order
+        text_embedding = outputs[1].squeeze()
+        logger.debug(f"Assuming text embedding is at output index 1 (total outputs: {len(outputs)})")
+    elif len(outputs) == 1: # If only one output, assume it's the text embedding in this context
+        text_embedding = outputs[0].squeeze()
+        logger.debug(f"Defaulting to output index 0 for text embedding (total outputs: {len(outputs)})")
+    else:
+        raise ValueError("ONNX model did not return any outputs for text embedding.")
+
+    text_embedding = normalize_embeddings(text_embedding).squeeze()
+    
+    return text_embedding, metadata
 
 
 async def get_embedding(input_str: str) -> tuple[np.ndarray, dict]:
