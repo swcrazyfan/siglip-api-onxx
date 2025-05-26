@@ -2,37 +2,51 @@ version: '3.8'
 
 services:
   siglip-api:
-    build: .
-    container_name: siglip-api
+    build:
+      context: .
+      # Consider adding cache_from for faster builds if you use a CI/CD pipeline
+      # cache_from:
+      #   - your-registry/your-image:latest # Example
+    container_name: siglip-api-onxx
     ports:
-      - "8001:8001"
+      - "8001:8001" # HostPort:ContainerPort
     environment:
-      - LOG_LEVEL=INFO
-      # Add any additional environment variables here
-      # - CUDA_VISIBLE_DEVICES=0  # Uncomment for GPU support
+      LOG_LEVEL: INFO
+      # For GPU support, ensure NVIDIA drivers and container toolkit are installed on the host
+      # CUDA_VISIBLE_DEVICES: 0 # Uncomment and set specific GPU if needed
+      # Add any other application-specific environment variables here
+      # EXAMPLE_VAR: "example_value"
     volumes:
-      # Mount local directory for image files (optional)
-      # - ./images:/home/user/app/images:ro
+      # Mount a host directory for persistent image storage (optional)
+      # - ./images:/home/user/app/images:ro # Read-only mount
       
-      # Mount model cache to avoid re-downloading
-      - /DATA/AppData/siglip-api-onxx/cache:/home/user/.cache
-
+      # Use a named volume for model cache for better management and persistence
+      - siglip-model-cache:/home/user/.cache
     restart: unless-stopped
-    # healthcheck:
-    #   test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
-    #   interval: 30s
-    #   timeout: 10s
-    #   retries: 3
-    #   start_period: 40s
-    # Uncomment for GPU support
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8001/health || exit 1"] # Added CMD-SHELL and exit 1 for clearer failure
+      interval: 30s    # How often to run the check
+      timeout: 10s     # How long to wait for a response
+      retries: 3       # How many times to retry before marking as unhealthy
+      start_period: 60s # Grace period for the container to start before health checks begin (increased for model loading)
+    # Uncomment and configure for GPU support if required
     # deploy:
     #   resources:
     #     reservations:
     #       devices:
     #         - driver: nvidia
-    #           count: 1
+    #           count: 1 # Or 'all' to use all available GPUs
     #           capabilities: [gpu]
+    logging: # Added logging configuration for better log management
+      driver: "json-file"
+      options:
+        max-size: "10m" # Max size of a log file before rotation
+        max-file: "3"   # Max number of log files to keep
 
-# volumes:
-#   siglip-model-cache:
-#     driver: local
+# Named volume for model cache
+volumes:
+  siglip-model-cache:
+    driver: local # Explicitly define the driver (default is local)
+    # You can specify external: true if the volume is managed outside of this compose file
+    # name: my-custom-cache-volume-name # Optionally, specify a custom name for the volume on the host
+
