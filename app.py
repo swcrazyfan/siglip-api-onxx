@@ -19,6 +19,7 @@ import re
 from pathlib import Path
 from functools import lru_cache
 import asyncio
+import time # Add this
 from contextlib import asynccontextmanager
 import json
 import uuid # Added for generating unique IDs
@@ -36,8 +37,12 @@ text_session = None
 processor = None
 tokenizer = None
 logit_scale = 100.0  # SigLIP's temperature parameter
+last_model_access_time = None
+model_lock = asyncio.Lock() # For thread-safe model loading/unloading
+model_management_task = None # To hold the background task
 
 # Model configuration
+MODEL_IDLE_TIMEOUT_SECONDS = 300  # Unload models after 5 minutes of inactivity
 MODEL_NAME = "pulsejet/siglip-base-patch16-256-multilingual-onnx"
 MAX_TEXT_TOKENS = 64
 IMAGE_SIZE = 256
@@ -86,14 +91,73 @@ class ClassifyRequest(BaseModel):
     model: str = Field(default="siglip-base-patch16-256-multilingual")
 
 
+async def _manage_model_lifecycle():
+    """Periodically checks if models should be unloaded due to inactivity."""
+    global last_model_access_time, model_lock
+    logger.info("Starting model lifecycle management task.")
+    try:
+        while True:
+            await asyncio.sleep(60) # Check every 60 seconds
+            async with model_lock: # Ensure exclusive access for checking/unloading
+                if vision_session is not None and last_model_access_time is not None:
+                    idle_time = time.time() - last_model_access_time
+                    if idle_time > MODEL_IDLE_TIMEOUT_SECONDS:
+                        logger.info(f"Models idle for {idle_time:.0f}s, exceeding timeout of {MODEL_IDLE_TIMEOUT_SECONDS}s.")
+                        # Direct unloading logic to avoid re-locking:
+                        logger.info("Unloading models due to inactivity (from lifecycle manager)...")
+                        global vision_session, text_session, processor, tokenizer # Ensure these are accessible
+                        vision_session = None
+                        text_session = None
+                        processor = None
+                        tokenizer = None
+                        last_model_access_time = None
+                        logger.info("Models unloaded (from lifecycle manager).")
+                    else:
+                        logger.debug(f"Models active. Idle time: {idle_time:.0f}s.")
+                elif vision_session is None:
+                    logger.debug("Models are currently not loaded. No action needed by lifecycle manager.")
+
+    except asyncio.CancelledError:
+        logger.info("Model lifecycle management task cancelled.")
+    except Exception as e:
+        logger.error(f"Error in model lifecycle management task: {e}", exc_info=True)
+    finally:
+        logger.info("Model lifecycle management task finished.")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifecycle"""
+    """Manage application lifecycle, including model loading and background task."""
+    global model_management_task
+    
     # Startup
+    logger.info("Application startup...")
+    # Initial load can be deferred to first request by not calling load_models() here,
+    # or load them now to make the first request faster.
+    # For now, let's keep initial load to ensure health check passes if it depends on models.
+    # If health check doesn't need models immediately, this can be removed.
     await load_models()
+    
+    # Start the background task
+    model_management_task = asyncio.create_task(_manage_model_lifecycle())
+    
     yield
+    
     # Shutdown
-    logger.info("Shutting down...")
+    logger.info("Application shutting down...")
+    if model_management_task:
+        logger.info("Cancelling model lifecycle management task...")
+        model_management_task.cancel()
+        try:
+            await model_management_task
+        except asyncio.CancelledError:
+            logger.info("Model lifecycle management task successfully cancelled on shutdown.")
+        except Exception as e: # Log any other exceptions during task shutdown
+            logger.error(f"Exception during model management task shutdown: {e}", exc_info=True)
+
+    # Ensure models are unloaded on shutdown, regardless of timeout
+    logger.info("Ensuring models are unloaded on final shutdown...")
+    await unload_models() # This uses its own lock, should be fine.
+    logger.info("Application shutdown complete.")
 
 
 # Create FastAPI app
@@ -114,47 +178,108 @@ app.add_middleware(
 )
 
 
+async def unload_models():
+    """Unload models and free up memory."""
+    global vision_session, text_session, processor, tokenizer, last_model_access_time
+    async with model_lock:
+        if vision_session is not None:
+            logger.info("Unloading models due to inactivity...")
+            vision_session = None
+            text_session = None
+            processor = None
+            tokenizer = None
+            last_model_access_time = None # Reset access time
+            # Python's garbage collector should handle the rest,
+            # but for ONNX Runtime, sessions might hold resources.
+            # Explicitly deleting might help, but usually None is enough.
+            # import gc
+            # gc.collect() # Optionally force garbage collection
+            logger.info("Models unloaded.")
+        else:
+            logger.debug("Models already unloaded or not loaded yet.")
+
+
 async def load_models():
-    """Load ONNX models and processors"""
-    global vision_session, text_session, processor, tokenizer
+    """Load ONNX models and processors if not already loaded."""
+    global vision_session, text_session, processor, tokenizer, last_model_access_time
     
-    logger.info("Loading SigLIP ONNX models...")
+    # Check if models are already loaded (not strictly necessary with the lock outside, but good practice)
+    if vision_session is not None and text_session is not None and processor is not None and tokenizer is not None:
+        logger.debug("Models are already loaded.")
+        # Update access time even if just checking
+        async with model_lock: # Ensure thread-safe update of last_model_access_time
+            last_model_access_time = time.time()
+        return
+
+    async with model_lock:
+        # Double-check inside the lock in case another coroutine loaded them while waiting
+        if vision_session is not None and text_session is not None and processor is not None and tokenizer is not None:
+            logger.debug("Models were loaded by another coroutine while waiting for lock.")
+            last_model_access_time = time.time()
+            return
+
+        logger.info("Loading SigLIP ONNX models...")
+        
+        try:
+            from huggingface_hub import hf_hub_download
+            
+            vision_model_path = hf_hub_download(
+                repo_id=MODEL_NAME,
+                filename="onnx/model_quantized.onnx"
+            )
+            
+            session_options = ort.SessionOptions()
+            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            
+            available_providers = ort.get_available_providers()
+            providers = []
+            if 'CUDAExecutionProvider' in available_providers:
+                providers.append('CUDAExecutionProvider')
+                logger.info("Using CUDA for acceleration")
+            providers.append('CPUExecutionProvider')
+            
+            current_vision_session = ort.InferenceSession(vision_model_path, session_options, providers=providers)
+            current_text_session = current_vision_session # SigLIP uses shared architecture
+            current_processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-256-multilingual")
+            current_tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-256-multilingual")
+
+            # Assign to global variables only after all are successfully loaded
+            vision_session = current_vision_session
+            text_session = current_text_session
+            processor = current_processor
+            tokenizer = current_tokenizer
+            
+            last_model_access_time = time.time()
+            logger.info("Models loaded successfully.")
+            
+        except Exception as e:
+            logger.error(f"Failed to load models: {e}")
+            # Reset any partially loaded models to ensure clean state
+            vision_session = None
+            text_session = None
+            processor = None
+            tokenizer = None
+            raise
+
+
+async def ensure_models_loaded():
+    """Ensures models are loaded before use, and updates access time."""
+    global last_model_access_time, vision_session, model_lock
     
-    try:
-        from huggingface_hub import hf_hub_download
-        
-        # Download ONNX model
-        vision_model_path = hf_hub_download(
-            repo_id=MODEL_NAME,
-            filename="onnx/model_quantized.onnx"
-        )
-        
-        # Create ONNX Runtime session
-        session_options = ort.SessionOptions()
-        session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
-        
-        # Detect available providers
-        available_providers = ort.get_available_providers()
-        providers = []
-        if 'CUDAExecutionProvider' in available_providers:
-            providers.append('CUDAExecutionProvider')
-            logger.info("Using CUDA for acceleration")
-        providers.append('CPUExecutionProvider')
-        
-        vision_session = ort.InferenceSession(vision_model_path, session_options, providers=providers)
-        
-        # For text, we'll use the same model (SigLIP uses shared architecture)
-        text_session = vision_session
-        
-        # Load processor and tokenizer
-        processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-256-multilingual")
-        tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-256-multilingual")
-        
-        logger.info("Models loaded successfully")
-        
-    except Exception as e:
-        logger.error(f"Failed to load models: {e}")
-        raise
+    # Quick check without lock
+    if vision_session is not None:
+        async with model_lock: # Lock for updating shared access time
+            last_model_access_time = time.time()
+            logger.debug("Models confirmed loaded, access time updated.")
+        return
+
+    # If not loaded, call load_models which handles locking internally
+    logger.debug("Models not loaded, attempting to load.")
+    await load_models() # load_models will set last_model_access_time on successful load
+    
+    if vision_session is None: # Verify loading was successful
+        logger.error("Critical: ensure_models_loaded called load_models, but models are still None.")
+        raise RuntimeError("Failed to ensure models are loaded. Models are still None after load attempt.")
 
 
 def detect_input_type(input_str: str) -> str:
@@ -258,6 +383,8 @@ def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
 
 async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.ndarray, dict]:
     """Get embedding for an image with metadata"""
+    await ensure_models_loaded() # Ensure models are ready and access time updated
+    
     if isinstance(image_input, str):
         image = await load_image_from_input(image_input)
     else:
@@ -310,6 +437,8 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
 
 async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[np.ndarray, dict]:
     """Get embedding for text with truncation warning"""
+    await ensure_models_loaded() # Ensure models are ready and access time updated
+    
     metadata = {"input_type": "text", "truncated": False}
     
     # Check token length
