@@ -15,6 +15,7 @@ services:
       # - ./images:/home/user/app/images:ro
       
       # Mount model cache to avoid re-downloading
+      - /DATA/AppData/siglip-api-onxx/cache:/home/user/.cache
 
     restart: unless-stopped
     # healthcheck:
