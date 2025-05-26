@@ -220,16 +220,16 @@ async def load_image_from_input(input_str: str) -> Image.Image:
     input_type = detect_input_type(input_str)
     
     if input_type == 'url':
-        async with asyncio.to_thread(requests.get, input_str, timeout=10) as response:
-            response.raise_for_status()
-            return Image.open(BytesIO(response.content)).convert('RGB')
+        response = await asyncio.to_thread(requests.get, input_str, timeout=10)
+        response.raise_for_status()
+        return Image.open(BytesIO(response.content)).convert('RGB')
     
     elif input_type == 'base64':
         image_bytes = decode_base64_image(input_str)
         return Image.open(BytesIO(image_bytes)).convert('RGB')
     
     elif input_type == 'file':
-        return await asyncio.to_thread(Image.open, input_str)
+        return await asyncio.to_thread(lambda p: Image.open(p).convert('RGB'), input_str)
     
     else:
         raise ValueError(f"Input appears to be text, not an image")

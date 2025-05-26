@@ -25,7 +25,7 @@ A lightweight, fast, and OpenAI-compatible API for multimodal embeddings using G
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/siglip-api-onxx.git
+git clone https://github.com/swcrazyfan/siglip-api-onxx.git
 cd siglip-api-onxx
 
 # Start the service
