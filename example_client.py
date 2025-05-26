@@ -15,7 +15,7 @@ from pathlib import Path
 class SigLIPClient:
     """Client for interacting with SigLIP API"""
     
-    def __init__(self, base_url: str = "http://localhost:8000"):
+    def __init__(self, base_url: str = "http://localhost:8001"):
         self.base_url = base_url.rstrip("/")
         self.session = requests.Session()
     
@@ -259,6 +259,6 @@ if __name__ == "__main__":
     try:
         main()
     except requests.exceptions.ConnectionError:
-        print("❌ Error: Could not connect to API. Make sure the server is running on http://localhost:8000")
+        print("❌ Error: Could not connect to API. Make sure the server is running on http://localhost:8001")
     except Exception as e:
         print(f"❌ Error: {e}")

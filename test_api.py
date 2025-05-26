@@ -31,7 +31,7 @@ def test_endpoint(name: str, method: str, url: str, json_data=None, expected_sta
 
 
 def main():
-    base_url = "http://localhost:8000"
+    base_url = "http://localhost:8001"
     
     print("🧪 SigLIP API Test Suite")
     print("=" * 50)

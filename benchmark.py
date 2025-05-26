@@ -93,7 +93,7 @@ def benchmark_concurrent(name: str, url: str, payload: dict, workers: int = 5, t
 
 
 def main():
-    base_url = "http://localhost:8000"
+    base_url = "http://localhost:8001"
     embeddings_url = f"{base_url}/v1/embeddings"
     
     print("🧪 SigLIP ONNX API Benchmark")

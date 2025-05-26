@@ -45,10 +45,10 @@ docker-compose down
 docker build -t siglip-api .
 
 # Run the container
-docker run -p 8000:8000 siglip-api
+docker run -p 8001:8001 siglip-api
 
 # With GPU support
-docker run --gpus all -p 8000:8000 siglip-api
+docker run --gpus all -p 8001:8001 siglip-api
 ```
 
 ### Local Development
@@ -58,7 +58,7 @@ docker run --gpus all -p 8000:8000 siglip-api
 pip install -r requirements.txt
 
 # Run the application
-uvicorn app:app --host 0.0.0.0 --port 8000 --reload
+uvicorn app:app --host 0.0.0.0 --port 8001 --reload
 ```
 
 ## 📡 API Endpoints
@@ -103,22 +103,22 @@ POST /v1/embeddings
 
 ```bash
 # Text embedding
-curl -X POST "http://localhost:8000/v1/embeddings" \
+curl -X POST "http://localhost:8001/v1/embeddings" \
   -H "Content-Type: application/json" \
   -d '{"input": "a beautiful sunset"}'
 
 # Image URL embedding
-curl -X POST "http://localhost:8000/v1/embeddings" \
+curl -X POST "http://localhost:8001/v1/embeddings" \
   -H "Content-Type: application/json" \
   -d '{"input": "https://example.com/image.jpg"}'
 
 # Base64 image embedding
-curl -X POST "http://localhost:8000/v1/embeddings" \
+curl -X POST "http://localhost:8001/v1/embeddings" \
   -H "Content-Type: application/json" \
   -d '{"input": "data:image/jpeg;base64,/9j/4AAQ..."}'
 
 # Multiple inputs
-curl -X POST "http://localhost:8000/v1/embeddings" \
+curl -X POST "http://localhost:8001/v1/embeddings" \
   -H "Content-Type: application/json" \
   -d '{
     "input": [
@@ -138,11 +138,11 @@ POST /v1/embeddings/image
 **Upload an image file:**
 ```bash
 # Upload image file
-curl -X POST "http://localhost:8000/v1/embeddings/image" \
+curl -X POST "http://localhost:8001/v1/embeddings/image" \
   -F "file=@/path/to/image.jpg"
 
 # With form data (text or URL)
-curl -X POST "http://localhost:8000/v1/embeddings/image" \
+curl -X POST "http://localhost:8001/v1/embeddings/image" \
   -F "input=a photo of a cat"
 ```
 
@@ -153,7 +153,7 @@ import requests
 # Upload file
 with open("image.jpg", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/v1/embeddings/image",
+        "http://localhost:8001/v1/embeddings/image",
         files={"file": ("image.jpg", f, "image/jpeg")}
     )
 ```
@@ -178,7 +178,7 @@ POST /v1/rank
 
 **Example:**
 ```bash
-curl -X POST "http://localhost:8000/v1/rank" \
+curl -X POST "http://localhost:8001/v1/rank" \
   -H "Content-Type: application/json" \
   -d '{
     "query": "cute animals",
@@ -206,7 +206,7 @@ POST /v1/classify
 
 **Example:**
 ```bash
-curl -X POST "http://localhost:8000/v1/classify" \
+curl -X POST "http://localhost:8001/v1/classify" \
   -H "Content-Type: application/json" \
   -d '{
     "image": "https://images.unsplash.com/photo-1514888286974-6c03e2ca1dba",
@@ -223,7 +223,7 @@ POST /v1/classify/image
 **Upload image and classify:**
 ```bash
 # Upload and classify
-curl -X POST "http://localhost:8000/v1/classify/image" \
+curl -X POST "http://localhost:8001/v1/classify/image" \
   -F "file=@/path/to/image.jpg" \
   -F "labels=cat,dog,bird,fish"
 ```
@@ -234,7 +234,7 @@ import requests
 
 with open("image.jpg", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/v1/classify/image",
+        "http://localhost:8001/v1/classify/image",
         files={"file": ("image.jpg", f, "image/jpeg")},
         data={"labels": "cat,dog,bird,fish"}
     )
@@ -255,13 +255,13 @@ import requests
 import numpy as np
 
 # Get embeddings for query and images
-query_resp = requests.post("http://localhost:8000/v1/embeddings", 
+query_resp = requests.post("http://localhost:8001/v1/embeddings", 
     json={"input": "sunset over mountains"})
 query_embedding = np.array(query_resp.json()["data"][0]["embedding"])
 
 # Get embeddings for your image database
 image_urls = ["image1.jpg", "image2.jpg", "image3.jpg"]
-images_resp = requests.post("http://localhost:8000/v1/embeddings",
+images_resp = requests.post("http://localhost:8001/v1/embeddings",
     json={"input": image_urls})
 
 # Calculate similarities
@@ -277,7 +277,7 @@ import requests
 # Upload and get embedding
 with open("local_image.jpg", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/v1/embeddings/image",
+        "http://localhost:8001/v1/embeddings/image",
         files={"file": f}
     )
     embedding = response.json()["data"][0]["embedding"]
@@ -285,7 +285,7 @@ with open("local_image.jpg", "rb") as f:
 # Upload and classify
 with open("local_image.jpg", "rb") as f:
     response = requests.post(
-        "http://localhost:8000/v1/classify/image",
+        "http://localhost:8001/v1/classify/image",
         files={"file": f},
         data={"labels": "cat,dog,bird"}
     )
@@ -296,7 +296,7 @@ with open("local_image.jpg", "rb") as f:
 Find images that match text descriptions or vice versa:
 ```python
 # Use the ranking endpoint
-response = requests.post("http://localhost:8000/v1/rank",
+response = requests.post("http://localhost:8001/v1/rank",
     json={
         "query": "a red sports car",
         "candidates": image_urls
