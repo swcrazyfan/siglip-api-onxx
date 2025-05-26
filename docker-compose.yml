@@ -15,7 +15,7 @@ services:
       # - ./images:/home/user/app/images:ro
       
       # Mount model cache to avoid re-downloading
-      # - siglip-model-cache:/home/user/.cache
+
     restart: unless-stopped
     # healthcheck:
     #   test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
