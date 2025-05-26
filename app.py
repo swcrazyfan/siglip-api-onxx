@@ -21,6 +21,7 @@ from functools import lru_cache
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import uuid # Added for generating unique IDs
 
 # Configure logging
 logging.basicConfig(
@@ -57,17 +58,23 @@ class EmbeddingResponse(BaseModel):
     usage: Dict[str, int]
 
 
-class RankRequest(BaseModel):
-    """Request model for ranking/similarity"""
+class RerankRequest(BaseModel):
+    """Request model for reranking documents based on a query."""
     model: str = Field(default="siglip-base-patch16-256-multilingual")
-    query: Union[str, List[str]] = Field(..., description="Query text or image(s)")
-    candidates: List[str] = Field(..., description="Candidates to rank")
-    return_scores: Optional[bool] = Field(default=True, description="Return similarity scores")
+    query: str = Field(..., description="The search query string.")
+    documents: List[str] = Field(..., description="A list of documents to rerank.")
+    top_n: Optional[int] = Field(None, description="The number of most relevant documents to return. If not specified, all documents are returned.")
+    return_documents: Optional[bool] = Field(False, description="Whether to return the document content in the response.")
 
+class RerankResult(BaseModel):
+    index: int = Field(..., description="The original index of the document in the input list.")
+    relevance_score: float = Field(..., description="The relevance score of the document to the query.")
+    document: Optional[str] = Field(None, description="The document content, if requested.")
 
-class RankResponse(BaseModel):
-    """Response model for ranking results"""
-    results: List[Dict[str, Any]]
+class RerankResponse(BaseModel):
+    """Response model for reranking results."""
+    id: Optional[str] = "rerank-1" # Placeholder ID
+    results: List[RerankResult]
     model: str
     usage: Dict[str, int]
 
@@ -504,94 +511,112 @@ async def create_embeddings_with_image(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/v1/rank", response_model=RankResponse)
-async def rank_candidates(request: RankRequest):
-    """Rank candidates by similarity to query"""
+@app.post("/v1/rerank", response_model=RerankResponse) # Changed endpoint name and response model
+async def rerank_documents(request: RerankRequest): # Changed function name and request model
+    """Rerank documents based on their relevance to a query."""
     try:
-        # Get query embeddings
-        queries = [request.query] if isinstance(request.query, str) else request.query
-        query_embeddings = []
+        # Get query embedding
+        query_embedding, _ = await get_embedding(request.query)
+        query_embedding = query_embedding.reshape(1, -1) # Ensure it's a row vector
+
+        # Get document embeddings
+        document_embeddings_list = []
+        for doc_text in request.documents:
+            embedding, _ = await get_embedding(doc_text)
+            document_embeddings_list.append(embedding)
         
-        for q in queries:
-            embedding, _ = await get_embedding(q)
-            query_embeddings.append(embedding)
+        if not document_embeddings_list:
+            return RerankResponse(
+                id=f"rerank-{str(uuid.uuid4())}", # Generate a UUID
+                results=[],
+                model=request.model,
+                usage={"prompt_tokens": 1, "total_tokens": 1} # Query token + 0 doc tokens
+            )
+
+        document_embeddings = np.array(document_embeddings_list)
         
-        query_embeddings = np.array(query_embeddings)
+        # Compute cosine similarities (query_embedding vs all document_embeddings)
+        # query_embedding: (1, D), document_embeddings: (N, D)
+        # Resulting similarities: (1, N)
+        similarities = np.dot(query_embedding, document_embeddings.T).squeeze() # Squeeze to (N,)
         
-        # Get candidate embeddings
-        candidate_embeddings = []
-        for c in request.candidates:
-            embedding, _ = await get_embedding(c)
-            candidate_embeddings.append(embedding)
-        
-        candidate_embeddings = np.array(candidate_embeddings)
-        
-        # Compute cosine similarities
-        similarities = np.dot(query_embeddings, candidate_embeddings.T)
-        
-        # Apply temperature scaling
-        scaled_similarities = logit_scale * similarities
-        
-        # Compute probabilities using sigmoid
-        probabilities = 1 / (1 + np.exp(-scaled_similarities))
-        
+        # Using raw similarities as relevance_score.
+        # SigLIP embeddings are already normalized, so dot product is cosine similarity.
+        # The logit_scale and sigmoid were for converting to probabilities,
+        # but for reranking, direct similarity scores are often preferred.
+        relevance_scores = similarities
+
         # Format results
-        results = []
-        for i, query in enumerate(queries):
-            query_results = []
-            for j, candidate in enumerate(request.candidates):
-                result = {
-                    "candidate": candidate,
-                    "score": float(probabilities[i, j]),
-                    "similarity": float(similarities[i, j])
-                }
-                query_results.append(result)
+        results_with_scores = []
+        for i, doc_text in enumerate(request.documents):
+            result_item = RerankResult(
+                index=i,
+                relevance_score=float(relevance_scores[i]),
+                document=doc_text if request.return_documents else None
+            )
+            results_with_scores.append(result_item)
             
-            # Sort by score
-            query_results.sort(key=lambda x: x['score'], reverse=True)
-            
-            results.append({
-                "query": query,
-                "rankings": query_results
-            })
+        # Sort by relevance_score in descending order
+        results_with_scores.sort(key=lambda x: x.relevance_score, reverse=True)
         
-        return RankResponse(
-            results=results,
+        # Apply top_n if specified
+        if request.top_n is not None and request.top_n > 0:
+            results_with_scores = results_with_scores[:request.top_n]
+        
+        # Calculate token usage (approximate)
+        # For simplicity, count 1 for query and 1 for each document.
+        # A more accurate count would involve tokenizing, but this is often sufficient for usage stats.
+        prompt_tokens = 1 + len(request.documents)
+        
+        return RerankResponse(
+            id=f"rerank-{str(uuid.uuid4())}", # Generate a UUID
+            results=results_with_scores,
             model=request.model,
             usage={
-                "prompt_tokens": len(queries) + len(request.candidates),
-                "total_tokens": len(queries) + len(request.candidates)
+                "prompt_tokens": prompt_tokens,
+                "total_tokens": prompt_tokens
             }
         )
         
     except Exception as e:
-        logger.error(f"Error in rank_candidates: {str(e)}")
+        logger.error(f"Error in rerank_documents: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/v1/classify")
 async def classify_image(request: ClassifyRequest):
     """Zero-shot image classification"""
-    rank_request = RankRequest(
-        model=request.model,
-        query=request.image,
-        candidates=request.labels
-    )
+    # Adapt to use the new RerankRequest structure
+    rerank_request_payload = {
+        "model": request.model,
+        "query": request.image,  # Image acts as the query
+        "documents": request.labels,  # Labels act as documents
+        "top_n": len(request.labels), # Return all scores for classification
+        "return_documents": True  # We need the labels back
+    }
+    rerank_request_obj = RerankRequest(**rerank_request_payload)
     
-    rank_response = await rank_candidates(rank_request)
-    
+    try:
+        rerank_response = await rerank_documents(rerank_request_obj)
+    except Exception as e:
+        logger.error(f"Error calling rerank_documents from classify_image: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Classification failed: {str(e)}")
+
     # Simplify response for classification
     classifications = []
-    for result in rank_response.results[0]["rankings"]:
+    for result in rerank_response.results:
         classifications.append({
-            "label": result["candidate"],
-            "score": result["score"]
+            "label": result.document,  # Assuming document is the label text
+            "score": result.relevance_score # Using relevance_score directly
         })
+    
+    # The rerank_response.results are already sorted by relevance_score
     
     return {
         "image": request.image,
         "classifications": classifications,
-        "model": request.model
+        "model": request.model,
+        "usage": rerank_response.usage # Pass through usage stats
     }
 
 
@@ -696,7 +721,7 @@ async def root():
             "/v1/models": "List available models (OpenAI compatible)",
             "/v1/embeddings": "Generate embeddings (OpenAI compatible)",
             "/v1/embeddings/image": "Generate embeddings with file upload",
-            "/v1/rank": "Rank candidates by similarity",
+            "/v1/rerank": "Rerank documents based on query relevance",
             "/v1/classify": "Zero-shot image classification",
             "/v1/classify/image": "Zero-shot classification with file upload",
             "/health": "Health check",
