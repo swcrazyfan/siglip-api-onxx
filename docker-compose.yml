@@ -12,8 +12,8 @@ services:
       - "8001:8001" # HostPort:ContainerPort
     environment:
       LOG_LEVEL: INFO
-      HF_HOME: /home/user/.cache/huggingface_cache # Define root for HF cache
-      TRANSFORMERS_CACHE: /home/user/.cache/huggingface_cache/transformers # Specific cache for transformers
+      HF_HOME: /home/user/.cache/huggingface # Standard Hugging Face cache location
+      # TRANSFORMERS_CACHE is deprecated, HF_HOME should be used.
       # For GPU support, ensure NVIDIA drivers and container toolkit are installed on the host
       # CUDA_VISIBLE_DEVICES: 0 # Uncomment and set specific GPU if needed
       # Add any other application-specific environment variables here
@@ -44,6 +44,8 @@ services:
       options:
         max-size: "10m" # Max size of a log file before rotation
         max-file: "3"   # Max number of log files to keep
+    networks: # Add service to litellm-network
+      - litellm-network
 
 # Named volume for model cache
 volumes:
@@ -51,4 +53,9 @@ volumes:
     driver: local # Explicitly define the driver (default is local)
     # You can specify external: true if the volume is managed outside of this compose file
     # name: my-custom-cache-volume-name # Optionally, specify a custom name for the volume on the host
+
+# Define the external network
+networks:
+  litellm-network:
+    external: true
 
