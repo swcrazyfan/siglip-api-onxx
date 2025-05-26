@@ -15,7 +15,7 @@ services:
       # - ./images:/home/user/app/images:ro
       
       # Mount model cache to avoid re-downloading
-      - /DATA/AppData/siglip-api-onxx/cache:/home/user/.cache
+      # - siglip-model-cache:/home/user/.cache
     restart: unless-stopped
     # healthcheck:
     #   test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
@@ -32,4 +32,6 @@ services:
     #           count: 1
     #           capabilities: [gpu]
 
-# No longer using named volumes for this service directly in this simplified setup
+# volumes:
+#   siglip-model-cache:
+#     driver: local
