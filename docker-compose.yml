@@ -12,6 +12,8 @@ services:
       - "8001:8001" # HostPort:ContainerPort
     environment:
       LOG_LEVEL: INFO
+      HF_HOME: /home/user/.cache/huggingface_cache # Define root for HF cache
+      TRANSFORMERS_CACHE: /home/user/.cache/huggingface_cache/transformers # Specific cache for transformers
       # For GPU support, ensure NVIDIA drivers and container toolkit are installed on the host
       # CUDA_VISIBLE_DEVICES: 0 # Uncomment and set specific GPU if needed
       # Add any other application-specific environment variables here

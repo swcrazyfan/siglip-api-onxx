@@ -38,9 +38,17 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 # Create non-root user
 RUN useradd -m -u 1000 user
+
+# Create and set permissions for the cache directory before switching to user
+# This ensures the user can write to the cache, especially when a volume is mounted here.
+RUN mkdir -p /home/user/.cache/huggingface_cache && \
+    chown -R user:user /home/user/.cache
+
 USER user
 ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:/opt/venv/bin:$PATH
+    PATH=/home/user/.local/bin:/opt/venv/bin:$PATH \
+    HF_HOME=/home/user/.cache/huggingface_cache \
+    TRANSFORMERS_CACHE=/home/user/.cache/huggingface_cache/transformers
 
 WORKDIR $HOME/app
 
