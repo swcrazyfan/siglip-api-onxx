@@ -36,27 +36,12 @@ COPY requirements.txt .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download the model during build (recommended for production)
-RUN python -c "\
-from transformers import AutoModel, AutoProcessor; \
-import torch; \
-import os; \
-print('Pre-downloading SigLIP 2 model...'); \
-model_name = 'google/siglip2-base-patch16-512'; \
-cache_dir = '/app/cache'; \
-try: \
-    print('Downloading model...'); \
-    model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir); \
-    print('Downloading processor...'); \
-    processor = AutoProcessor.from_pretrained(model_name, cache_dir=cache_dir); \
-    print('Model pre-download completed successfully!'); \
-except Exception as e: \
-    print(f'Warning: Model pre-download failed: {e}'); \
-    print('Model will be downloaded at runtime instead.'); \
-"
-
 # Copy application code
 COPY app.py .
+COPY download_model.py .
+
+# Pre-download the model during build (recommended for production)
+RUN python download_model.py
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
