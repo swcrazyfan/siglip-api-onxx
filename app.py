@@ -1,5 +1,6 @@
 """
-SigLIP ONNX API - Fast multimodal embeddings with OpenAI-compatible endpoints
+SigLIP 2 API - Fast multimodal embeddings with OpenAI-compatible endpoints
+Uses google/siglip2-base-patch16-512 with PyTorch backend
 Supports text and image inputs with automatic detection
 """
 
@@ -9,8 +10,8 @@ from pydantic import BaseModel, Field
 from typing import Union, List, Optional, Dict, Any
 import numpy as np
 from PIL import Image
-import onnxruntime as ort
-from transformers import AutoTokenizer, AutoProcessor
+import torch
+from transformers import AutoModel, AutoProcessor
 import requests
 from io import BytesIO
 import logging
@@ -42,16 +43,13 @@ else:
 
 # Global variables for models
 _model_load_lock = asyncio.Lock()  # Lock for synchronizing model loading
-vision_session = None
-text_session = None
+model = None
 processor = None
-tokenizer = None
-logit_scale = 100.0  # SigLIP's temperature parameter
+device = None
 
 # Model configuration
-MODEL_NAME = "pulsejet/siglip-base-patch16-256-multilingual-onnx"
+MODEL_NAME = "google/siglip2-base-patch16-512"
 MAX_TEXT_TOKENS = 64
-IMAGE_SIZE = 256
 
 
 class JointInputItem(BaseModel):
@@ -61,7 +59,7 @@ class JointInputItem(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     """OpenAI-compatible embedding request"""
-    model: str = Field(default="siglip-base-patch16-256-multilingual")
+    model: str = Field(default="siglip2-base-patch16-512")
     input: Union[str, List[Union[str, JointInputItem]]] = Field(..., description="A single string (text/image URL/base64/file path), or a list containing strings and/or joint image-text objects.")
     encoding_format: Optional[str] = Field(default="float", description="Format of the embeddings")
 
@@ -76,7 +74,7 @@ class EmbeddingResponse(BaseModel):
 
 class RankRequest(BaseModel):
     """Request model for ranking/similarity"""
-    model: str = Field(default="siglip-base-patch16-256-multilingual")
+    model: str = Field(default="siglip2-base-patch16-512")
     query: Union[str, List[str]] = Field(..., description="Query text or image(s)")
     candidates: List[str] = Field(..., description="Candidates to rank")
     return_scores: Optional[bool] = Field(default=True, description="Return similarity scores")
@@ -93,7 +91,7 @@ class ClassifyRequest(BaseModel):
     """Request model for zero-shot classification"""
     image: str = Field(..., description="Image URL, base64, or file path")
     labels: List[str] = Field(..., description="Classification labels")
-    model: str = Field(default="siglip-base-patch16-256-multilingual")
+    model: str = Field(default="siglip2-base-patch16-512")
 
 
 @asynccontextmanager
@@ -108,9 +106,9 @@ async def lifespan(app: FastAPI):
 
 # Create FastAPI app
 app = FastAPI(
-    title="SigLIP ONNX Embeddings API",
-    description="Fast multimodal embeddings with OpenAI-compatible endpoints",
-    version="1.0.0",
+    title="SigLIP 2 Embeddings API",
+    description="Fast multimodal embeddings with OpenAI-compatible endpoints using google/siglip2-base-patch16-512",
+    version="2.0.0",
     lifespan=lifespan
 )
 
@@ -125,48 +123,49 @@ app.add_middleware(
 
 
 async def load_models():
-    """Load ONNX models and processors"""
-    global vision_session, text_session, processor, tokenizer
+    """Load SigLIP 2 model and processor"""
+    global model, processor, device
     
     async with _model_load_lock:  # Ensure only one coroutine loads models at a time
         # Check if models are already loaded after acquiring the lock
-        if all(component is not None for component in [vision_session, text_session, processor, tokenizer]):
+        if all(component is not None for component in [model, processor, device]):
             logger.debug("Models already loaded by another coroutine")
             return
             
-        logger.info("Loading SigLIP ONNX models...")
+        logger.info("Loading SigLIP 2 model and processor...")
         
         try:
-            from huggingface_hub import hf_hub_download
+            # Determine device with proper order: MPS > CUDA > CPU
+            if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+                device = torch.device("mps")
+                logger.info("Using MPS (Apple Silicon) device")
+            elif torch.cuda.is_available():
+                device = torch.device("cuda")
+                logger.info(f"Using CUDA device: {torch.cuda.get_device_name()}")
+            else:
+                device = torch.device("cpu")
+                logger.info("Using CPU device")
             
-            # Download ONNX model
-            vision_model_path = hf_hub_download(
-                repo_id=MODEL_NAME,
-                filename="onnx/model_quantized.onnx"
-            )
+            # Load model with appropriate settings for the device
+            if device.type == "cuda":
+                model = AutoModel.from_pretrained(
+                    MODEL_NAME,
+                    torch_dtype=torch.float16,  # Use half precision for GPU
+                    device_map="auto"
+                )
+            else:
+                model = AutoModel.from_pretrained(MODEL_NAME)
+                model.to(device)
             
-            # Create ONNX Runtime session
-            session_options = ort.SessionOptions()
-            session_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+            # Load processor
+            processor = AutoProcessor.from_pretrained(MODEL_NAME)
             
-            # Detect available providers
-            available_providers = ort.get_available_providers()
-            providers = []
-            if 'CUDAExecutionProvider' in available_providers:
-                providers.append('CUDAExecutionProvider')
-                logger.info("Using CUDA for acceleration")
-            providers.append('CPUExecutionProvider')
+            # Set model to evaluation mode
+            model.eval()
             
-            vision_session = ort.InferenceSession(vision_model_path, session_options, providers=providers)
-            
-            # For text, we'll use the same model (SigLIP uses shared architecture)
-            text_session = vision_session
-            
-            # Load processor and tokenizer
-            processor = AutoProcessor.from_pretrained("google/siglip-base-patch16-256-multilingual")
-            tokenizer = AutoTokenizer.from_pretrained("google/siglip-base-patch16-256-multilingual")
-            
-            logger.info("Models loaded successfully")
+            logger.info(f"Successfully loaded SigLIP 2 model: {MODEL_NAME}")
+            logger.info(f"Model device: {next(model.parameters()).device}")
+            logger.info(f"Model dtype: {next(model.parameters()).dtype}")
             
         except Exception as e:
             logger.error(f"Failed to load models: {e}")
@@ -175,9 +174,9 @@ async def load_models():
 
 async def ensure_models_loaded():
     """Ensure all required model components are loaded"""
-    global vision_session, text_session, processor, tokenizer
+    global model, processor, device
     
-    if any(component is None for component in [vision_session, text_session, processor, tokenizer]):
+    if any(component is None for component in [model, processor, device]):
         logger.info("One or more model components not loaded, initializing...")
         await load_models()
     else:
@@ -283,6 +282,11 @@ def normalize_embeddings(embeddings: np.ndarray) -> np.ndarray:
     return embeddings / (norm + 1e-12)
 
 
+def preprocess_texts(texts: List[str]) -> List[str]:
+    """Preprocess text queries using SigLIP 2 prompt template"""
+    return [f'This is a photo of {text}.' for text in texts]
+
+
 async def get_embedding(input_str: str) -> tuple[np.ndarray, dict]:
     """Get embedding for any input type"""
     await ensure_models_loaded()
@@ -308,62 +312,21 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     else:
         image = image_input
     
-    # Process image
-    image_inputs = processor(images=image, return_tensors="np")
+    # Process image with SigLIP 2 processor
+    inputs = processor(images=image, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # Prepare input feed - for image-only, only pixel_values are needed.
-    # The model's ONNX graph likely defines input_ids and attention_mask as optional.
-    input_feed = {
-        "pixel_values": image_inputs['pixel_values']
-    }
-    # Log which inputs are being sent
-    logger.debug(f"Sending to ONNX for image embedding, input_feed keys: {list(input_feed.keys())}")
-
-    # Run inference
-    outputs = await asyncio.to_thread(vision_session.run, None, input_feed)
-
-    # Log raw output shapes and names for debugging
-    if vision_session and outputs:
-        output_node_names = [node.name for node in vision_session.get_outputs()]
-        logger.info(f"ONNX session output node names (image path): {output_node_names}")
-        logger.info(f"Raw outputs shapes from ONNX session (image path): {[o.shape for o in outputs]}")
-
-        image_embedding_array = None
-        possible_image_embed_names = ["image_embeds", "image_embeddings", "image_features", "vision_features"]
-        
-        for i, name in enumerate(output_node_names):
-            if name in possible_image_embed_names:
-                image_embedding_array = outputs[i]
-                logger.info(f"Found image embedding output '{name}' at index {i} with shape {image_embedding_array.shape}")
-                break
-        
-        if image_embedding_array is None:
-            if outputs and len(outputs) > 3: # Fallback to outputs[3] if no named output found and enough outputs exist
-                logger.warning(f"Could not find a known image embedding output name in {output_node_names}. Falling back to outputs[3].")
-                image_embedding_array = outputs[3]
-            elif outputs: # Fallback to outputs[0] if not enough outputs for index 3
-                 logger.warning(f"Could not find a known image embedding output name or index 3. Falling back to outputs[0]. This might be incorrect.")
-                 image_embedding_array = outputs[0]
-            else:
-                logger.error("ONNX session returned no outputs (image path).")
-                raise ValueError("ONNX session returned no outputs for image embedding.")
-    elif not outputs:
-        logger.error("ONNX session returned no outputs (image path) (outputs list is empty or None).")
-        raise ValueError("ONNX session returned no outputs for image embedding.")
-    else: # Should not happen
-        logger.error("vision_session is None, cannot process outputs (image path).")
-        raise ValueError("vision_session is not loaded.")
-
-    # Extract and normalize embedding
-    if image_embedding_array.ndim == 0:
-        logger.error(f"Image embedding array is a scalar: {image_embedding_array}. Cannot process.")
-        raise ValueError("Image embedding output from ONNX model is a scalar.")
-        
-    embedding = image_embedding_array.squeeze()
-    logger.info(f"Shape of image embedding after squeeze: {embedding.shape}")
-
+    # Get image features using SigLIP 2 - only pass expected arguments
+    with torch.no_grad():
+        image_features = model.get_image_features(
+            pixel_values=inputs.get('pixel_values')
+        )
+        embedding = image_features[0].cpu().numpy()
+    
+    # Normalize embedding
     embedding = normalize_embeddings(embedding).squeeze()
-    logger.info(f"Shape of image embedding after normalize_embeddings and final squeeze: {embedding.shape}")
+    
+    logger.debug(f"Image embedding shape: {embedding.shape}")
     
     return embedding, {"input_type": "image", "truncated": False}
 
@@ -373,103 +336,62 @@ async def get_joint_embedding(image_input_str: str, text_input_str: str, warn_te
     await ensure_models_loaded()
 
     # 1. Process Image
-    if isinstance(image_input_str, str): # Should always be str from JointInputItem
+    if isinstance(image_input_str, str):
         image = await load_image_from_input(image_input_str)
     else:
-        # This case should ideally not be hit if called from JointInputItem
         logger.warning("get_joint_embedding received non-string image_input_str, attempting to use as PIL.Image")
         image = image_input_str
         if not isinstance(image, Image.Image):
             raise ValueError("Invalid image_input_str type for joint embedding if not a string.")
 
-    image_processed_inputs = processor(images=image, return_tensors="np")
-    pixel_values = image_processed_inputs['pixel_values']
-    image_tokens_count = 1 # As per our decision
+    # 2. Preprocess text with SigLIP 2 prompt template
+    processed_text = preprocess_texts([text_input_str])
 
-    # 2. Process Text
-    text_metadata = {"input_type": "text", "truncated": False} # Temp metadata for text part
-    
-    # Check token length for the text part
-    test_tokens = tokenizer(text_input_str, return_tensors="np", truncation=False)
-    actual_text_length = len(test_tokens['input_ids'][0])
-    
-    # Tokenize text with truncation and padding
-    text_tokenized_inputs = tokenizer(
-        text_input_str,
-        return_tensors="np",
+    # 3. Use processor with BOTH image and text - SigLIP 2 approach
+    inputs = processor(
+        text=processed_text,
+        images=image,
         padding="max_length",
-        truncation=True,
-        max_length=MAX_TEXT_TOKENS
+        max_length=MAX_TEXT_TOKENS,
+        return_tensors="pt"
     )
-    input_ids = text_tokenized_inputs['input_ids']
-    attention_mask = text_tokenized_inputs['attention_mask']
     
-    processed_text_token_count = input_ids.shape[1]
-    text_metadata["processed_tokens"] = processed_text_token_count
-
-    if actual_text_length > MAX_TEXT_TOKENS:
-        text_metadata["truncated"] = True
-        text_metadata["original_tokens"] = actual_text_length
-        if warn_text_truncation:
-            truncated_ratio = ((actual_text_length - MAX_TEXT_TOKENS) / actual_text_length) * 100
-            logger.warning(
-                f"Joint input: Text part was {actual_text_length} tokens long and has been truncated/padded to {processed_text_token_count} tokens. "
-                f"Original text truncated by {truncated_ratio:.1f}%."
-            )
-    elif actual_text_length < processed_text_token_count:
-        logger.info(f"Joint input: Text part was {actual_text_length} tokens long and has been padded to {processed_text_token_count} tokens.")
-
-    # 3. Prepare combined input feed for ONNX
-    input_feed = {
-        "input_ids": input_ids,
-        "attention_mask": attention_mask,
-        "pixel_values": pixel_values
-    }
+    # Move inputs to device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
     
-    # Ensure batch sizes match (should be 1 for both if processing single joint pair)
-    if input_ids.shape[0] != pixel_values.shape[0]:
-        # This should not happen if both are from a single JointInputItem
-        raise ValueError(f"Batch size mismatch between text ({input_ids.shape[0]}) and image ({pixel_values.shape[0]}) inputs for joint embedding.")
-
-    # 4. Run ONNX Inference
-    outputs = await asyncio.to_thread(text_session.run, None, input_feed)
-
-    # 5. Extract preferred embedding (text_embeds, conditioned on image)
-    output_node_names = [node.name for node in text_session.get_outputs()]
-    logger.info(f"ONNX session output node names (joint path): {output_node_names}")
-    logger.info(f"Raw outputs shapes from ONNX session (joint path): {[o.shape for o in outputs]}")
-
-    text_embedding_array = None
-    possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
-    text_embed_idx = -1
-
-    for i, name in enumerate(output_node_names):
-        if name in possible_text_embed_names:
-            text_embedding_array = outputs[i]
-            text_embed_idx = i
-            logger.info(f"Found text embedding output '{name}' at index {i} with shape {text_embedding_array.shape} for joint input.")
-            break
+    logger.debug(f"Joint processor returned keys: {list(inputs.keys())}")
     
-    if text_embedding_array is None:
-        # Fallback or error if specific named output not found
-        if outputs and len(outputs) > 2 : # Default to index 2 if text_embeds is consistently there
-             logger.warning(f"Could not find a known text embedding output name in {output_node_names} for joint input. Falling back to outputs[2].")
-             text_embedding_array = outputs[2]
-        else:
-            logger.error("ONNX session returned insufficient outputs or known text embedding not found for joint input.")
-            raise ValueError("Could not extract text embedding for joint input.")
+    # Get processed token count for metadata
+    processed_text_token_count = inputs['input_ids'].shape[1] if 'input_ids' in inputs else MAX_TEXT_TOKENS
+    
+    # Check for text truncation (simple estimation)
+    original_length = len(text_input_str.split())  # Simple word count
+    text_metadata = {"truncated": original_length > MAX_TEXT_TOKENS}
+    
+    if text_metadata["truncated"] and warn_text_truncation:
+        logger.warning(f"Joint input: Text part may have been truncated. Original ~{original_length} words.")
 
-    embedding = text_embedding_array.squeeze()
-    embedding = normalize_embeddings(embedding).squeeze()
+    # 4. Run SigLIP 2 inference to get both embeddings
+    with torch.no_grad():
+        outputs = model(
+            input_ids=inputs.get('input_ids'),
+            attention_mask=inputs.get('attention_mask'),
+            pixel_values=inputs.get('pixel_values')
+        )
+        
+        # Get text embeddings (conditioned on image)
+        text_embeds = outputs.text_embeds[0].cpu().numpy()
+    
+    # Normalize embedding
+    embedding = normalize_embeddings(text_embeds).squeeze()
 
-    # 6. Prepare final metadata
+    # 5. Prepare final metadata
     final_metadata = {
         "input_type": "joint_image_text",
         "text_truncated": text_metadata["truncated"],
-        "original_text_tokens": text_metadata.get("original_tokens"),
         "processed_text_tokens": processed_text_token_count,
-        "image_tokens": image_tokens_count,
-        "total_processed_tokens": processed_text_token_count + image_tokens_count
+        "image_tokens": 1,  # SigLIP treats image as single token conceptually
+        "total_processed_tokens": processed_text_token_count + 1
     }
     
     return embedding, final_metadata
@@ -481,100 +403,44 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
     
     metadata = {"input_type": "text", "truncated": False}
     
-    # Check token length
-    test_tokens = tokenizer(text, return_tensors="np", truncation=False)
-    actual_length = len(test_tokens['input_ids'][0])
+    # Preprocess text with SigLIP 2 prompt template
+    processed_text = preprocess_texts([text])
     
-    # Process with truncation and padding
-    text_inputs = tokenizer(
-        text,
-        return_tensors="np",
-        padding="max_length", # Pad to max_length to ensure consistent input shape
-        truncation=True,
-        max_length=MAX_TEXT_TOKENS
+    # Process text with SigLIP 2 - IMPORTANT: padding="max_length" and max_length=64
+    inputs = processor(
+        text=processed_text,
+        padding="max_length",
+        max_length=MAX_TEXT_TOKENS,
+        return_tensors="pt"
     )
     
-    # The number of tokens actually processed and fed to the model
-    processed_token_count = text_inputs['input_ids'].shape[1]
+    # Move inputs to device
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+    
+    # Update metadata
+    processed_token_count = inputs['input_ids'].shape[1] if 'input_ids' in inputs else MAX_TEXT_TOKENS
     metadata["processed_tokens"] = processed_token_count
 
-    if actual_length > MAX_TEXT_TOKENS:
+    # Simple truncation check (word-based approximation)
+    original_length = len(text.split())
+    if original_length > MAX_TEXT_TOKENS and warn_truncation:
         metadata["truncated"] = True
-        metadata["original_tokens"] = actual_length
-        # metadata["processed_tokens"] is already set by now to MAX_TEXT_TOKENS due to truncation and padding="max_length"
-        
-        if warn_truncation:
-            truncated_ratio = ((actual_length - MAX_TEXT_TOKENS) / actual_length) * 100
-            logger.warning(
-                f"Text input was {actual_length} tokens long and has been truncated/padded to {processed_token_count} tokens. "
-                f"Original text truncated by {truncated_ratio:.1f}%."
-            )
-    elif actual_length < processed_token_count: # Check if padding occurred (and no truncation)
-        logger.info(f"Text input was {actual_length} tokens long and has been padded to {processed_token_count} tokens.")
-    # If actual_length == processed_token_count and not > MAX_TEXT_TOKENS, no truncation or significant padding occurred.
+        logger.warning(f"Text input may have been truncated. Original ~{original_length} words.")
     
-    # Run inference - for text-only, only input_ids and attention_mask are needed.
-    # The model's ONNX graph likely defines pixel_values as optional.
-    input_feed = {
-        "input_ids": text_inputs['input_ids'],
-        "attention_mask": text_inputs['attention_mask']
-    }
-    # Log which inputs are being sent
-    logger.debug(f"Sending to ONNX for text embedding, input_feed keys: {list(input_feed.keys())}")
+    logger.debug(f"Sending to SigLIP 2 for text embedding, input keys: {list(inputs.keys())}")
     
-    outputs = await asyncio.to_thread(text_session.run, None, input_feed)
+    # Get text features using SigLIP 2 - only pass the expected arguments
+    with torch.no_grad():
+        text_features = model.get_text_features(
+            input_ids=inputs.get('input_ids'),
+            attention_mask=inputs.get('attention_mask')
+        )
+        embedding = text_features[0].cpu().numpy()
 
-    # Log raw output shapes and names for debugging
-    if text_session and outputs:
-        output_node_names = [node.name for node in text_session.get_outputs()]
-        logger.info(f"ONNX session output node names: {output_node_names}")
-        logger.info(f"Raw outputs shapes from ONNX session: {[o.shape for o in outputs]}")
-
-        # Attempt to find the text embedding output by name
-        text_embedding_array = None
-        # Common names for text embeddings output
-        possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
-        
-        for i, name in enumerate(output_node_names):
-            if name in possible_text_embed_names:
-                text_embedding_array = outputs[i]
-                logger.info(f"Found text embedding output '{name}' at index {i} with shape {text_embedding_array.shape}")
-                break
-        
-        if text_embedding_array is None:
-            # Based on logs, 'text_embeds' is at index 2.
-            # Output nodes: ['logits_per_image', 'logits_per_text', 'text_embeds', 'image_embeds']
-            if outputs and len(outputs) > 2:
-                logger.warning(f"Could not find a known text embedding output name in {output_node_names}. Falling back to outputs[2].")
-                text_embedding_array = outputs[2]
-            elif outputs and len(outputs) > 0 : # Broader fallback to outputs[0] if not enough outputs for index 2
-                 logger.warning(f"Could not find a known text embedding output name or index 2. Falling back to outputs[0]. This might be incorrect.")
-                 text_embedding_array = outputs[0]
-            else:
-                logger.error("ONNX session returned no outputs.")
-                raise ValueError("ONNX session returned no outputs for text embedding.")
-    elif not outputs:
-        logger.error("ONNX session returned no outputs (outputs list is empty or None).")
-        raise ValueError("ONNX session returned no outputs for text embedding.")
-    else: # Should not happen if ensure_models_loaded worked
-        logger.error("text_session is None, cannot process outputs.")
-        raise ValueError("text_session is not loaded.")
-
-    # Extract and normalize embedding
-    if text_embedding_array.ndim == 0: # Check if it's a scalar
-        logger.error(f"Text embedding array is a scalar: {text_embedding_array}. Cannot process.")
-        raise ValueError("Text embedding output from ONNX model is a scalar.")
-
-    embedding = text_embedding_array.squeeze()
-    logger.info(f"Shape of embedding after squeeze: {embedding.shape}")
-    
-    if embedding.ndim == 0: # Check if squeeze resulted in a scalar
-         logger.warning(f"Embedding became scalar after squeeze: {embedding}. This might lead to errors in normalization if not handled.")
-         # If it's scalar, normalization might not be meaningful or possible in the current way.
-         # For now, let normalize_embeddings handle it, but this is a point of concern.
-
+    # Normalize embedding
     embedding = normalize_embeddings(embedding).squeeze()
-    logger.info(f"Shape of embedding after normalize_embeddings and final squeeze: {embedding.shape}")
+    
+    logger.debug(f"Text embedding shape: {embedding.shape}")
     
     return embedding, metadata
 
@@ -631,7 +497,7 @@ async def create_embeddings(request: EmbeddingRequest):
 async def create_embeddings_with_image(
     file: Optional[UploadFile] = File(None, description="Image file to get embedding for"),
     input: Optional[str] = Form(None, description="Text input or image URL/base64"),
-    model: str = Form("siglip-base-patch16-256-multilingual", description="Model to use"),
+    model: str = Form("siglip2-base-patch16-512", description="Model to use"),
     encoding_format: str = Form("float", description="Format of the embeddings")
 ):
     """
@@ -724,11 +590,8 @@ async def rank_candidates(request: RankRequest):
         # Compute cosine similarities
         similarities = np.dot(query_embeddings, candidate_embeddings.T)
         
-        # Apply temperature scaling
-        scaled_similarities = logit_scale * similarities
-        
-        # Compute probabilities using sigmoid
-        probabilities = 1 / (1 + np.exp(-scaled_similarities))
+        # Apply sigmoid for SigLIP 2 (no temperature scaling needed)
+        probabilities = 1 / (1 + np.exp(-similarities))
         
         # Format results
         results = []
@@ -794,7 +657,7 @@ async def classify_image(request: ClassifyRequest):
 async def classify_uploaded_image(
     file: UploadFile = File(..., description="Image file to classify"),
     labels: str = Form(..., description="Comma-separated list of labels"),
-    model: str = Form("siglip-base-patch16-256-multilingual", description="Model to use")
+    model: str = Form("siglip2-base-patch16-512", description="Model to use")
 ):
     """Zero-shot image classification with file upload"""
     try:
@@ -824,9 +687,8 @@ async def classify_uploaded_image(
         # Compute similarities
         similarities = np.dot(image_embedding.reshape(1, -1), label_embeddings.T).squeeze()
         
-        # Apply temperature scaling and sigmoid
-        scaled_similarities = logit_scale * similarities
-        probabilities = 1 / (1 + np.exp(-scaled_similarities))
+        # Apply sigmoid for SigLIP 2
+        probabilities = 1 / (1 + np.exp(-similarities))
         
         # Format results
         classifications = []
@@ -859,12 +721,12 @@ async def list_models():
         "object": "list",
         "data": [
             {
-                "id": "siglip-base-patch16-256-multilingual",
+                "id": "siglip2-base-patch16-512",
                 "object": "model",
                 "created": 1677610602,  # Arbitrary timestamp
                 "owned_by": "google",
                 "permission": [],
-                "root": "siglip-base-patch16-256-multilingual",
+                "root": "siglip2-base-patch16-512",
                 "parent": None,
             }
         ]
@@ -876,8 +738,9 @@ async def health_check():
     """Health check endpoint"""
     return {
         "status": "healthy",
-        "model_loaded": vision_session is not None,
-        "version": "1.0.0"
+        "model_loaded": model is not None,
+        "device": str(device) if device else "unknown",
+        "version": "2.0.0"
     }
 
 
@@ -885,8 +748,10 @@ async def health_check():
 async def root():
     """Root endpoint with API information"""
     return {
-        "name": "SigLIP ONNX Embeddings API",
-        "version": "1.0.0",
+        "name": "SigLIP 2 Embeddings API",
+        "version": "2.0.0",
+        "model": MODEL_NAME,
+        "device": str(device) if device else "unknown",
         "endpoints": {
             "/v1/models": "List available models (OpenAI compatible)",
             "/v1/embeddings": "Generate embeddings (OpenAI compatible)",

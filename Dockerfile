@@ -1,71 +1,73 @@
-# Multi-stage build for smaller final image
-FROM python:3.10-slim AS builder
+FROM python:3.12-slim
 
-# Install build dependencies
+# Set environment variables
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV HF_HOME=/app/cache
+ENV TRANSFORMERS_CACHE=/app/cache
+ENV PIP_NO_CACHE_DIR=1
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Add labels to link the package to your repository
+LABEL org.opencontainers.image.source=https://github.com/swcrazyfan/siglip-api-onxx
+LABEL org.opencontainers.image.description="SigLIP 2 API with PyTorch"
+
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
-    gcc \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
-
-# Create virtual environment
-RUN python -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-# Copy and install requirements
-WORKDIR /build
-COPY requirements.txt .
-RUN pip install --no-cache-dir --upgrade pip && \
-    pip install --no-cache-dir -r requirements.txt
-
-# Runtime stage
-FROM python:3.10-slim
-
-# Install only runtime dependencies
-RUN apt-get update && apt-get install -y \
+    git \
+    curl \
+    build-essential \
     libgomp1 \
     libglib2.0-0 \
     libsm6 \
     libxext6 \
     libxrender-dev \
-    libgomp1 \
-    wget \
-    curl \
-    && rm -rf /var/lib/apt/lists/*
+    && rm -rf /var/lib/apt/lists/* \
+    && apt-get clean
 
-# Copy virtual environment from builder
-COPY --from=builder /opt/venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
+# Create app directory and cache directory
+WORKDIR /app
+RUN mkdir -p /app/cache
 
-# Create non-root user
-RUN useradd -m -u 1000 user
+# Copy requirements first for better caching
+COPY requirements.txt .
 
-# Create and set permissions for the base cache directory before switching to user.
-# The Hugging Face library will create subdirectories (like 'huggingface/hub') within this.
-RUN mkdir -p /home/user/.cache && \
-    chown -R user:user /home/user/.cache
+# Upgrade pip and install Python dependencies
+RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir -r requirements.txt
 
-USER user
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:/opt/venv/bin:$PATH \
-    HF_HOME=/home/user/.cache/huggingface
-    # TRANSFORMERS_CACHE is deprecated and removed, HF_HOME is preferred.
-
-WORKDIR $HOME/app
+# Pre-download the model during build (recommended for production)
+RUN python -c "\
+from transformers import AutoModel, AutoProcessor; \
+import torch; \
+import os; \
+print('Pre-downloading SigLIP 2 model...'); \
+model_name = 'google/siglip2-base-patch16-512'; \
+cache_dir = '/app/cache'; \
+try: \
+    print('Downloading model...'); \
+    model = AutoModel.from_pretrained(model_name, cache_dir=cache_dir); \
+    print('Downloading processor...'); \
+    processor = AutoProcessor.from_pretrained(model_name, cache_dir=cache_dir); \
+    print('Model pre-download completed successfully!'); \
+except Exception as e: \
+    print(f'Warning: Model pre-download failed: {e}'); \
+    print('Model will be downloaded at runtime instead.'); \
+"
 
 # Copy application code
-COPY --chown=user:user app.py .
+COPY app.py .
 
-# Pre-download the model during build for faster startup (optional)
-# Uncomment the following lines if you want to include the model in the image
-# This will increase image size but reduce startup time
-# RUN python -c "from huggingface_hub import hf_hub_download; \
-#     hf_hub_download('pulsejet/siglip-base-patch16-256-multilingual-onnx', 'onnx/model_quantized.onnx')"
+# Create non-root user for security
+RUN useradd --create-home --shell /bin/bash app && \
+    chown -R app:app /app
+USER app
 
 # Expose port
 EXPOSE 8001
 
 # Health check
-HEALTHCHECK --interval=30s --timeout=10s --start-period=30s --retries=3 \
+HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
     CMD curl -f http://localhost:8001/health || exit 1
 
 # Run the application
