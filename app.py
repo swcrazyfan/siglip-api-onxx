@@ -21,13 +21,24 @@ from functools import lru_cache
 import asyncio
 from contextlib import asynccontextmanager
 import json
+import os
+
+# Verbose output toggle
+# Controlled by environment variable SIGLIP_VERBOSE_OUTPUT (e.g., "true" or "false")
+# Defaults to true (verbose output enabled).
+VERBOSE_OUTPUT_ENV = os.getenv("SIGLIP_VERBOSE_OUTPUT", "true").lower()
+VERBOSE_OUTPUT = VERBOSE_OUTPUT_ENV == "true"
 
 # Configure logging
 logging.basicConfig(
-    level=logging.INFO,
+    level=logging.DEBUG if VERBOSE_OUTPUT else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+if VERBOSE_OUTPUT:
+    logger.info("Verbose output enabled (DEBUG level logging). To disable, set environment variable SIGLIP_VERBOSE_OUTPUT=false.")
+else:
+    logger.info("Verbose output disabled (INFO level logging). To enable, set environment variable SIGLIP_VERBOSE_OUTPUT=true.")
 
 # Global variables for models
 _model_load_lock = asyncio.Lock()  # Lock for synchronizing model loading
@@ -300,24 +311,13 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     # Process image
     image_inputs = processor(images=image, return_tensors="np")
     
-    # Prepare input feed
-    input_feed = {}
-    batch_size = image_inputs['pixel_values'].shape[0]
-
-    for model_input_node in vision_session.get_inputs():
-        node_name = model_input_node.name
-        if node_name == "pixel_values":
-            input_feed[node_name] = image_inputs['pixel_values']
-        elif node_name == "input_ids":
-            # Provide dummy input_ids for image-only inference
-            # e.g., a single padding token or a generic token
-            dummy_input_ids = np.array([[tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0]] * batch_size, dtype=np.int64)
-            input_feed[node_name] = dummy_input_ids
-        # elif node_name == "attention_mask": # Optional: provide dummy attention_mask if model requires it
-            # dummy_attention_mask = np.ones_like(dummy_input_ids, dtype=np.int64)
-            # input_feed[node_name] = dummy_attention_mask
-        # else:
-            # logger.warning(f"Model expects an input '{node_name}' not handled in image_embedding.")
+    # Prepare input feed - for image-only, only pixel_values are needed.
+    # The model's ONNX graph likely defines input_ids and attention_mask as optional.
+    input_feed = {
+        "pixel_values": image_inputs['pixel_values']
+    }
+    # Log which inputs are being sent
+    logger.debug(f"Sending to ONNX for image embedding, input_feed keys: {list(input_feed.keys())}")
 
     # Run inference
     outputs = await asyncio.to_thread(vision_session.run, None, input_feed)
@@ -513,29 +513,14 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
         logger.info(f"Text input was {actual_length} tokens long and has been padded to {processed_token_count} tokens.")
     # If actual_length == processed_token_count and not > MAX_TEXT_TOKENS, no truncation or significant padding occurred.
     
-    # Run inference
-    input_feed = {}
-    # Determine batch size from the actual text inputs
-    batch_size = text_inputs['input_ids'].shape[0]
-
-    # Ensure all model inputs defined in the ONNX graph are provided
-    for model_input_node in text_session.get_inputs():
-        node_name = model_input_node.name
-        if node_name == "input_ids":
-            input_feed[node_name] = text_inputs['input_ids']
-        elif node_name == "attention_mask":
-            input_feed[node_name] = text_inputs['attention_mask']
-        elif node_name == "pixel_values":
-            # Provide dummy pixel_values for text-only inference
-            # Expected shape: (batch_size, num_channels, height, width)
-            # Expected dtype: float32 (common for image models)
-            dummy_pixel_values = np.zeros(
-                (batch_size, 3, IMAGE_SIZE, IMAGE_SIZE), # IMAGE_SIZE is a global constant
-                dtype=np.float32
-            )
-            input_feed[node_name] = dummy_pixel_values
-        # else:
-            # logger.warning(f"Model expects an input '{node_name}' not handled in text_embedding.")
+    # Run inference - for text-only, only input_ids and attention_mask are needed.
+    # The model's ONNX graph likely defines pixel_values as optional.
+    input_feed = {
+        "input_ids": text_inputs['input_ids'],
+        "attention_mask": text_inputs['attention_mask']
+    }
+    # Log which inputs are being sent
+    logger.debug(f"Sending to ONNX for text embedding, input_feed keys: {list(input_feed.keys())}")
     
     outputs = await asyncio.to_thread(text_session.run, None, input_feed)
 
@@ -557,9 +542,14 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
                 break
         
         if text_embedding_array is None:
-            if outputs: # Fallback to outputs[0] if no named output found
-                logger.warning(f"Could not find a known text embedding output name in {output_node_names}. Falling back to outputs[0].")
-                text_embedding_array = outputs[0]
+            # Based on logs, 'text_embeds' is at index 2.
+            # Output nodes: ['logits_per_image', 'logits_per_text', 'text_embeds', 'image_embeds']
+            if outputs and len(outputs) > 2:
+                logger.warning(f"Could not find a known text embedding output name in {output_node_names}. Falling back to outputs[2].")
+                text_embedding_array = outputs[2]
+            elif outputs and len(outputs) > 0 : # Broader fallback to outputs[0] if not enough outputs for index 2
+                 logger.warning(f"Could not find a known text embedding output name or index 2. Falling back to outputs[0]. This might be incorrect.")
+                 text_embedding_array = outputs[0]
             else:
                 logger.error("ONNX session returned no outputs.")
                 raise ValueError("ONNX session returned no outputs for text embedding.")
