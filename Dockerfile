@@ -40,9 +40,6 @@ RUN pip install --upgrade pip setuptools wheel && \
 COPY app.py .
 COPY download_model.py .
 
-# Pre-download the model during build (recommended for production)
-RUN python download_model.py
-
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
     chown -R app:app /app
@@ -51,9 +48,13 @@ USER app
 # Expose port
 EXPOSE 8001
 
-# Health check
-HEALTHCHECK --interval=30s --timeout=30s --start-period=120s --retries=3 \
+# Health check - increased start period since model downloads at startup
+HEALTHCHECK --interval=30s --timeout=30s --start-period=300s --retries=3 \
     CMD curl -f http://localhost:8001/health || exit 1
 
-# Run the application
-CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8001", "--workers", "1"]
+# Create startup script to download model then start the application
+RUN echo '#!/bin/bash\necho "Downloading model on startup..."\npython download_model.py\necho "Starting application..."\nexec uvicorn app:app --host 0.0.0.0 --port 8001 --workers 1' > /app/start.sh && \
+    chmod +x /app/start.sh
+
+# Run the startup script
+CMD ["/app/start.sh"]
