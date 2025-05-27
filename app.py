@@ -295,16 +295,70 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     # Process image
     image_inputs = processor(images=image, return_tensors="np")
     
+    # Prepare input feed
+    input_feed = {}
+    batch_size = image_inputs['pixel_values'].shape[0]
+
+    for model_input_node in vision_session.get_inputs():
+        node_name = model_input_node.name
+        if node_name == "pixel_values":
+            input_feed[node_name] = image_inputs['pixel_values']
+        elif node_name == "input_ids":
+            # Provide dummy input_ids for image-only inference
+            # e.g., a single padding token or a generic token
+            dummy_input_ids = np.array([[tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0]] * batch_size, dtype=np.int64)
+            input_feed[node_name] = dummy_input_ids
+        # elif node_name == "attention_mask": # Optional: provide dummy attention_mask if model requires it
+            # dummy_attention_mask = np.ones_like(dummy_input_ids, dtype=np.int64)
+            # input_feed[node_name] = dummy_attention_mask
+        # else:
+            # logger.warning(f"Model expects an input '{node_name}' not handled in image_embedding.")
+
     # Run inference
-    outputs = await asyncio.to_thread(
-        vision_session.run,
-        None,
-        {vision_session.get_inputs()[0].name: image_inputs['pixel_values']}
-    )
-    
+    outputs = await asyncio.to_thread(vision_session.run, None, input_feed)
+
+    # Log raw output shapes and names for debugging
+    if vision_session and outputs:
+        output_node_names = [node.name for node in vision_session.get_outputs()]
+        logger.info(f"ONNX session output node names (image path): {output_node_names}")
+        logger.info(f"Raw outputs shapes from ONNX session (image path): {[o.shape for o in outputs]}")
+
+        image_embedding_array = None
+        possible_image_embed_names = ["image_embeds", "image_embeddings", "image_features", "vision_features"]
+        
+        for i, name in enumerate(output_node_names):
+            if name in possible_image_embed_names:
+                image_embedding_array = outputs[i]
+                logger.info(f"Found image embedding output '{name}' at index {i} with shape {image_embedding_array.shape}")
+                break
+        
+        if image_embedding_array is None:
+            if outputs and len(outputs) > 3: # Fallback to outputs[3] if no named output found and enough outputs exist
+                logger.warning(f"Could not find a known image embedding output name in {output_node_names}. Falling back to outputs[3].")
+                image_embedding_array = outputs[3]
+            elif outputs: # Fallback to outputs[0] if not enough outputs for index 3
+                 logger.warning(f"Could not find a known image embedding output name or index 3. Falling back to outputs[0]. This might be incorrect.")
+                 image_embedding_array = outputs[0]
+            else:
+                logger.error("ONNX session returned no outputs (image path).")
+                raise ValueError("ONNX session returned no outputs for image embedding.")
+    elif not outputs:
+        logger.error("ONNX session returned no outputs (image path) (outputs list is empty or None).")
+        raise ValueError("ONNX session returned no outputs for image embedding.")
+    else: # Should not happen
+        logger.error("vision_session is None, cannot process outputs (image path).")
+        raise ValueError("vision_session is not loaded.")
+
     # Extract and normalize embedding
-    embedding = outputs[0].squeeze()  # Adjust index based on model output
+    if image_embedding_array.ndim == 0:
+        logger.error(f"Image embedding array is a scalar: {image_embedding_array}. Cannot process.")
+        raise ValueError("Image embedding output from ONNX model is a scalar.")
+        
+    embedding = image_embedding_array.squeeze()
+    logger.info(f"Shape of image embedding after squeeze: {embedding.shape}")
+
     embedding = normalize_embeddings(embedding).squeeze()
+    logger.info(f"Shape of image embedding after normalize_embeddings and final squeeze: {embedding.shape}")
     
     return embedding, {"input_type": "image", "truncated": False}
 
@@ -319,40 +373,106 @@ async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[n
     test_tokens = tokenizer(text, return_tensors="np", truncation=False)
     actual_length = len(test_tokens['input_ids'][0])
     
-    if actual_length > MAX_TEXT_TOKENS:
-        metadata["truncated"] = True
-        metadata["original_tokens"] = actual_length
-        metadata["processed_tokens"] = MAX_TEXT_TOKENS
-        
-        if warn_truncation:
-            truncated_ratio = ((actual_length - MAX_TEXT_TOKENS) / actual_length) * 100
-            logger.warning(
-                f"Text has {actual_length} tokens but SigLIP only processes {MAX_TEXT_TOKENS}. "
-                f"Truncating {truncated_ratio:.1f}% of input!"
-            )
-    
-    # Process with truncation
+    # Process with truncation and padding
     text_inputs = tokenizer(
         text,
         return_tensors="np",
-        padding=True,
+        padding="max_length", # Pad to max_length to ensure consistent input shape
         truncation=True,
         max_length=MAX_TEXT_TOKENS
     )
     
+    # The number of tokens actually processed and fed to the model
+    processed_token_count = text_inputs['input_ids'].shape[1]
+    metadata["processed_tokens"] = processed_token_count
+
+    if actual_length > MAX_TEXT_TOKENS:
+        metadata["truncated"] = True
+        metadata["original_tokens"] = actual_length
+        # metadata["processed_tokens"] is already set by now to MAX_TEXT_TOKENS due to truncation and padding="max_length"
+        
+        if warn_truncation:
+            truncated_ratio = ((actual_length - MAX_TEXT_TOKENS) / actual_length) * 100
+            logger.warning(
+                f"Text input was {actual_length} tokens long and has been truncated/padded to {processed_token_count} tokens. "
+                f"Original text truncated by {truncated_ratio:.1f}%."
+            )
+    elif actual_length < processed_token_count: # Check if padding occurred (and no truncation)
+        logger.info(f"Text input was {actual_length} tokens long and has been padded to {processed_token_count} tokens.")
+    # If actual_length == processed_token_count and not > MAX_TEXT_TOKENS, no truncation or significant padding occurred.
+    
     # Run inference
     input_feed = {}
-    for i, input_name in enumerate(text_session.get_inputs()):
-        if input_name.name == "input_ids":
-            input_feed[input_name.name] = text_inputs['input_ids']
-        elif input_name.name == "attention_mask":
-            input_feed[input_name.name] = text_inputs['attention_mask']
+    # Determine batch size from the actual text inputs
+    batch_size = text_inputs['input_ids'].shape[0]
+
+    # Ensure all model inputs defined in the ONNX graph are provided
+    for model_input_node in text_session.get_inputs():
+        node_name = model_input_node.name
+        if node_name == "input_ids":
+            input_feed[node_name] = text_inputs['input_ids']
+        elif node_name == "attention_mask":
+            input_feed[node_name] = text_inputs['attention_mask']
+        elif node_name == "pixel_values":
+            # Provide dummy pixel_values for text-only inference
+            # Expected shape: (batch_size, num_channels, height, width)
+            # Expected dtype: float32 (common for image models)
+            dummy_pixel_values = np.zeros(
+                (batch_size, 3, IMAGE_SIZE, IMAGE_SIZE), # IMAGE_SIZE is a global constant
+                dtype=np.float32
+            )
+            input_feed[node_name] = dummy_pixel_values
+        # else:
+            # logger.warning(f"Model expects an input '{node_name}' not handled in text_embedding.")
     
     outputs = await asyncio.to_thread(text_session.run, None, input_feed)
-    
+
+    # Log raw output shapes and names for debugging
+    if text_session and outputs:
+        output_node_names = [node.name for node in text_session.get_outputs()]
+        logger.info(f"ONNX session output node names: {output_node_names}")
+        logger.info(f"Raw outputs shapes from ONNX session: {[o.shape for o in outputs]}")
+
+        # Attempt to find the text embedding output by name
+        text_embedding_array = None
+        # Common names for text embeddings output
+        possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
+        
+        for i, name in enumerate(output_node_names):
+            if name in possible_text_embed_names:
+                text_embedding_array = outputs[i]
+                logger.info(f"Found text embedding output '{name}' at index {i} with shape {text_embedding_array.shape}")
+                break
+        
+        if text_embedding_array is None:
+            if outputs: # Fallback to outputs[0] if no named output found
+                logger.warning(f"Could not find a known text embedding output name in {output_node_names}. Falling back to outputs[0].")
+                text_embedding_array = outputs[0]
+            else:
+                logger.error("ONNX session returned no outputs.")
+                raise ValueError("ONNX session returned no outputs for text embedding.")
+    elif not outputs:
+        logger.error("ONNX session returned no outputs (outputs list is empty or None).")
+        raise ValueError("ONNX session returned no outputs for text embedding.")
+    else: # Should not happen if ensure_models_loaded worked
+        logger.error("text_session is None, cannot process outputs.")
+        raise ValueError("text_session is not loaded.")
+
     # Extract and normalize embedding
-    embedding = outputs[0].squeeze()  # Adjust based on model output
+    if text_embedding_array.ndim == 0: # Check if it's a scalar
+        logger.error(f"Text embedding array is a scalar: {text_embedding_array}. Cannot process.")
+        raise ValueError("Text embedding output from ONNX model is a scalar.")
+
+    embedding = text_embedding_array.squeeze()
+    logger.info(f"Shape of embedding after squeeze: {embedding.shape}")
+    
+    if embedding.ndim == 0: # Check if squeeze resulted in a scalar
+         logger.warning(f"Embedding became scalar after squeeze: {embedding}. This might lead to errors in normalization if not handled.")
+         # If it's scalar, normalization might not be meaningful or possible in the current way.
+         # For now, let normalize_embeddings handle it, but this is a point of concern.
+
     embedding = normalize_embeddings(embedding).squeeze()
+    logger.info(f"Shape of embedding after normalize_embeddings and final squeeze: {embedding.shape}")
     
     return embedding, metadata
 
