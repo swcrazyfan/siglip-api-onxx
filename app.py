@@ -43,10 +43,15 @@ MAX_TEXT_TOKENS = 64
 IMAGE_SIZE = 256
 
 
+class JointInputItem(BaseModel):
+    image: str = Field(..., description="Image URL, base64 image, or file path for the image part of the joint input.")
+    text: str = Field(..., description="Text to associate with the image for the joint input.")
+    # embedding_preference: Optional[str] = Field(default="text_embeds", description="Which embedding to return for joint: 'text_embeds' or 'image_embeds'")
+
 class EmbeddingRequest(BaseModel):
     """OpenAI-compatible embedding request"""
     model: str = Field(default="siglip-base-patch16-256-multilingual")
-    input: Union[str, List[str]] = Field(..., description="Text, image URL, base64 image, or file path")
+    input: Union[str, List[Union[str, JointInputItem]]] = Field(..., description="A single string (text/image URL/base64/file path), or a list containing strings and/or joint image-text objects.")
     encoding_format: Optional[str] = Field(default="float", description="Format of the embeddings")
 
 
@@ -363,6 +368,113 @@ async def get_image_embedding(image_input: Union[str, Image.Image]) -> tuple[np.
     return embedding, {"input_type": "image", "truncated": False}
 
 
+async def get_joint_embedding(image_input_str: str, text_input_str: str, warn_text_truncation: bool = True) -> tuple[np.ndarray, dict]:
+    """Get a joint embedding for an image and text pair."""
+    await ensure_models_loaded()
+
+    # 1. Process Image
+    if isinstance(image_input_str, str): # Should always be str from JointInputItem
+        image = await load_image_from_input(image_input_str)
+    else:
+        # This case should ideally not be hit if called from JointInputItem
+        logger.warning("get_joint_embedding received non-string image_input_str, attempting to use as PIL.Image")
+        image = image_input_str
+        if not isinstance(image, Image.Image):
+            raise ValueError("Invalid image_input_str type for joint embedding if not a string.")
+
+    image_processed_inputs = processor(images=image, return_tensors="np")
+    pixel_values = image_processed_inputs['pixel_values']
+    image_tokens_count = 1 # As per our decision
+
+    # 2. Process Text
+    text_metadata = {"input_type": "text", "truncated": False} # Temp metadata for text part
+    
+    # Check token length for the text part
+    test_tokens = tokenizer(text_input_str, return_tensors="np", truncation=False)
+    actual_text_length = len(test_tokens['input_ids'][0])
+    
+    # Tokenize text with truncation and padding
+    text_tokenized_inputs = tokenizer(
+        text_input_str,
+        return_tensors="np",
+        padding="max_length",
+        truncation=True,
+        max_length=MAX_TEXT_TOKENS
+    )
+    input_ids = text_tokenized_inputs['input_ids']
+    attention_mask = text_tokenized_inputs['attention_mask']
+    
+    processed_text_token_count = input_ids.shape[1]
+    text_metadata["processed_tokens"] = processed_text_token_count
+
+    if actual_text_length > MAX_TEXT_TOKENS:
+        text_metadata["truncated"] = True
+        text_metadata["original_tokens"] = actual_text_length
+        if warn_text_truncation:
+            truncated_ratio = ((actual_text_length - MAX_TEXT_TOKENS) / actual_text_length) * 100
+            logger.warning(
+                f"Joint input: Text part was {actual_text_length} tokens long and has been truncated/padded to {processed_text_token_count} tokens. "
+                f"Original text truncated by {truncated_ratio:.1f}%."
+            )
+    elif actual_text_length < processed_text_token_count:
+        logger.info(f"Joint input: Text part was {actual_text_length} tokens long and has been padded to {processed_text_token_count} tokens.")
+
+    # 3. Prepare combined input feed for ONNX
+    input_feed = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+        "pixel_values": pixel_values
+    }
+    
+    # Ensure batch sizes match (should be 1 for both if processing single joint pair)
+    if input_ids.shape[0] != pixel_values.shape[0]:
+        # This should not happen if both are from a single JointInputItem
+        raise ValueError(f"Batch size mismatch between text ({input_ids.shape[0]}) and image ({pixel_values.shape[0]}) inputs for joint embedding.")
+
+    # 4. Run ONNX Inference
+    outputs = await asyncio.to_thread(text_session.run, None, input_feed)
+
+    # 5. Extract preferred embedding (text_embeds, conditioned on image)
+    output_node_names = [node.name for node in text_session.get_outputs()]
+    logger.info(f"ONNX session output node names (joint path): {output_node_names}")
+    logger.info(f"Raw outputs shapes from ONNX session (joint path): {[o.shape for o in outputs]}")
+
+    text_embedding_array = None
+    possible_text_embed_names = ["text_embeds", "text_embeddings", "text_features"]
+    text_embed_idx = -1
+
+    for i, name in enumerate(output_node_names):
+        if name in possible_text_embed_names:
+            text_embedding_array = outputs[i]
+            text_embed_idx = i
+            logger.info(f"Found text embedding output '{name}' at index {i} with shape {text_embedding_array.shape} for joint input.")
+            break
+    
+    if text_embedding_array is None:
+        # Fallback or error if specific named output not found
+        if outputs and len(outputs) > 2 : # Default to index 2 if text_embeds is consistently there
+             logger.warning(f"Could not find a known text embedding output name in {output_node_names} for joint input. Falling back to outputs[2].")
+             text_embedding_array = outputs[2]
+        else:
+            logger.error("ONNX session returned insufficient outputs or known text embedding not found for joint input.")
+            raise ValueError("Could not extract text embedding for joint input.")
+
+    embedding = text_embedding_array.squeeze()
+    embedding = normalize_embeddings(embedding).squeeze()
+
+    # 6. Prepare final metadata
+    final_metadata = {
+        "input_type": "joint_image_text",
+        "text_truncated": text_metadata["truncated"],
+        "original_text_tokens": text_metadata.get("original_tokens"),
+        "processed_text_tokens": processed_text_token_count,
+        "image_tokens": image_tokens_count,
+        "total_processed_tokens": processed_text_token_count + image_tokens_count
+    }
+    
+    return embedding, final_metadata
+
+
 async def get_text_embedding(text: str, warn_truncation: bool = True) -> tuple[np.ndarray, dict]:
     """Get embedding for text with truncation warning"""
     await ensure_models_loaded()
@@ -485,15 +597,25 @@ async def create_embeddings(request: EmbeddingRequest):
         embeddings = []
         total_tokens = 0
         
-        for idx, inp in enumerate(inputs):
-            embedding, metadata = await get_embedding(inp)
-            
-            # Track tokens for text inputs
-            if metadata["input_type"] == "text":
-                total_tokens += metadata.get("processed_tokens", 1)
+        for idx, item in enumerate(inputs):
+            if isinstance(item, str):
+                embedding, metadata = await get_embedding(item)
+                # Token counting for simple string (text or image)
+                if metadata["input_type"] == "text":
+                    # Use MAX_TEXT_TOKENS as default if "processed_tokens" is somehow missing after our fixes
+                    total_tokens += metadata.get("processed_tokens", MAX_TEXT_TOKENS)
+                else: # image
+                    total_tokens += 1 # Image counted as 1 token, as decided
+            elif isinstance(item, JointInputItem): # Pydantic automatically converts dict to JointInputItem
+                embedding, metadata = await get_joint_embedding(item.image, item.text)
+                # For joint input, sum image tokens (1) and processed text tokens
+                total_tokens += metadata.get("total_processed_tokens", MAX_TEXT_TOKENS + 1) # Default if somehow missing
             else:
-                total_tokens += 1  # Count images as 1 token
-            
+                # This case should ideally not be reached due to Pydantic validation
+                # on EmbeddingRequest.input which now includes JointInputItem
+                logger.error(f"Unexpected item type in input list: {type(item)} - {item}")
+                raise HTTPException(status_code=400, detail=f"Invalid input item type: {type(item)}")
+
             embeddings.append({
                 "object": "embedding",
                 "index": idx,
