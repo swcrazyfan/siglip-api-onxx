@@ -26,7 +26,7 @@ def test_openai_text_embedding():
     
     payload = {
         "input": "a beautiful sunset over the ocean",
-        "model": "siglip2-base-patch16-512"
+        "model": "siglip2-large-patch16-512"
     }
     
     response = requests.post(f"{BASE_URL}/v1/embeddings", json=payload)
@@ -52,7 +52,7 @@ def test_openai_batch_text_embedding():
             "a photo of a dog", 
             "a red sports car"
         ],
-        "model": "siglip2-base-patch16-512"
+        "model": "siglip2-large-patch16-512"
     }
     
     response = requests.post(f"{BASE_URL}/v1/embeddings", json=payload)

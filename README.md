@@ -77,7 +77,7 @@ Returns the available model(s) in OpenAI format. Required for LiteLLM integratio
   "object": "list",
   "data": [
     {
-      "id": "siglip-base-patch16-256-multilingual",
+      "id": "siglip2-large-patch16-512",
       "object": "model",
       "owned_by": "google"
     }
@@ -95,7 +95,7 @@ POST /v1/embeddings
 ```json
 {
   "input": "a photo of a cat",
-  "model": "siglip-base-patch16-256-multilingual"
+  "model": "siglip2-large-patch16-512"
 }
 ```
 
@@ -352,11 +352,11 @@ docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
 
 ## 📊 Model Information
 
-- **Model**: SigLIP base patch16 256 multilingual
-- **Parameters**: ~400M
-- **Embedding Dimension**: 768
+- **Model**: SigLIP 2 large patch16 512
+- **Parameters**: ~1.1B
+- **Embedding Dimension**: 1152
 - **Max Text Length**: 64 tokens
-- **Image Resolution**: 256x256
+- **Image Resolution**: 512x512
 - **Languages**: Multilingual (best performance on English)
 
 ## 🤝 Contributing

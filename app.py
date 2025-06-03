@@ -1,6 +1,6 @@
 """
 SigLIP 2 API - Fast multimodal embeddings with OpenAI-compatible endpoints
-Uses google/siglip2-base-patch16-512 with PyTorch backend
+Uses google/siglip2-large-patch16-512 with PyTorch backend
 Supports text and image inputs with automatic detection
 """
 
@@ -48,7 +48,7 @@ processor = None
 device = None
 
 # Model configuration
-MODEL_NAME = "google/siglip2-base-patch16-512"
+MODEL_NAME = "google/siglip2-large-patch16-512"
 MAX_TEXT_TOKENS = 64
 
 
@@ -59,7 +59,7 @@ class JointInputItem(BaseModel):
 
 class EmbeddingRequest(BaseModel):
     """OpenAI-compatible embedding request"""
-    model: str = Field(default="siglip2-base-patch16-512")
+    model: str = Field(default="siglip2-large-patch16-512")
     input: Union[str, List[Union[str, JointInputItem]]] = Field(..., description="A single string (text/image URL/base64/file path), or a list containing strings and/or joint image-text objects.")
     encoding_format: Optional[str] = Field(default="float", description="Format of the embeddings")
 
@@ -74,7 +74,7 @@ class EmbeddingResponse(BaseModel):
 
 class RankRequest(BaseModel):
     """Request model for ranking/similarity"""
-    model: str = Field(default="siglip2-base-patch16-512")
+    model: str = Field(default="siglip2-large-patch16-512")
     query: Union[str, List[str]] = Field(..., description="Query text or image(s)")
     candidates: List[str] = Field(..., description="Candidates to rank")
     return_scores: Optional[bool] = Field(default=True, description="Return similarity scores")
@@ -91,7 +91,7 @@ class ClassifyRequest(BaseModel):
     """Request model for zero-shot classification"""
     image: str = Field(..., description="Image URL, base64, or file path")
     labels: List[str] = Field(..., description="Classification labels")
-    model: str = Field(default="siglip2-base-patch16-512")
+    model: str = Field(default="siglip2-large-patch16-512")
 
 
 @asynccontextmanager
@@ -107,7 +107,7 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app
 app = FastAPI(
     title="SigLIP 2 Embeddings API",
-    description="Fast multimodal embeddings with OpenAI-compatible endpoints using google/siglip2-base-patch16-512",
+    description="Fast multimodal embeddings with OpenAI-compatible endpoints using google/siglip2-large-patch16-512",
     version="2.0.0",
     lifespan=lifespan
 )
@@ -497,7 +497,7 @@ async def create_embeddings(request: EmbeddingRequest):
 async def create_embeddings_with_image(
     file: Optional[UploadFile] = File(None, description="Image file to get embedding for"),
     input: Optional[str] = Form(None, description="Text input or image URL/base64"),
-    model: str = Form("siglip2-base-patch16-512", description="Model to use"),
+    model: str = Form("siglip2-large-patch16-512", description="Model to use"),
     encoding_format: str = Form("float", description="Format of the embeddings")
 ):
     """
@@ -657,7 +657,7 @@ async def classify_image(request: ClassifyRequest):
 async def classify_uploaded_image(
     file: UploadFile = File(..., description="Image file to classify"),
     labels: str = Form(..., description="Comma-separated list of labels"),
-    model: str = Form("siglip2-base-patch16-512", description="Model to use")
+    model: str = Form("siglip2-large-patch16-512", description="Model to use")
 ):
     """Zero-shot image classification with file upload"""
     try:
@@ -716,18 +716,17 @@ async def classify_uploaded_image(
 
 @app.get("/v1/models")
 async def list_models():
-    """List available models - OpenAI compatible endpoint"""
+    """List available models (OpenAI compatible)"""
+    await ensure_models_loaded()
     return {
         "object": "list",
         "data": [
             {
-                "id": "siglip2-base-patch16-512",
+                "id": "siglip2-large-patch16-512",
                 "object": "model",
-                "created": 1677610602,  # Arbitrary timestamp
                 "owned_by": "google",
-                "permission": [],
-                "root": "siglip2-base-patch16-512",
-                "parent": None,
+                "root": "siglip2-large-patch16-512",
+                "permission": []
             }
         ]
     }
