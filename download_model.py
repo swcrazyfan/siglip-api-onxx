@@ -8,7 +8,8 @@ import torch
 import os
 
 print('Pre-downloading SigLIP 2 model...')
-model_name = 'google/siglip2-large-patch16-512'
+model_name = os.getenv('SIGLIP_MODEL', 'google/siglip2-base-patch16-512')
+print(f'Model: {model_name}')
 cache_dir = '/app/cache'
 
 try:

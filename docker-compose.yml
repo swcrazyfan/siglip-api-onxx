@@ -5,12 +5,14 @@ services:
       # Consider adding cache_from for faster builds if you use a CI/CD pipeline
       # cache_from:
       #   - your-registry/your-image:latest # Example
-    container_name: siglip-api-onxx
+    container_name: siglip2-api
     ports:
       - "8001:8001" # HostPort:ContainerPort
     environment:
       LOG_LEVEL: INFO
       HF_HOME: /home/user/.cache/huggingface # Standard Hugging Face cache location
+      # Model selection - options: google/siglip2-base-patch16-512, google/siglip2-large-patch16-512
+      # SIGLIP_MODEL: google/siglip2-large-patch16-512  # Uncomment to use large model
       # TRANSFORMERS_CACHE is deprecated, HF_HOME should be used.
       # For GPU support, ensure NVIDIA drivers and container toolkit are installed on the host
       # CUDA_VISIBLE_DEVICES: 0 # Uncomment and set specific GPU if needed

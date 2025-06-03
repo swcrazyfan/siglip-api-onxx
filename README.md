@@ -310,11 +310,44 @@ rankings = response.json()["results"][0]["rankings"]
 - **Image Size**: Images are resized to 256x256 pixels
 - **Languages**: Optimized for multilingual text but trained primarily on English image-text pairs
 
-## 🔧 Configuration
+## �� Configuration
+
+### Model Selection
+
+Choose between different SigLIP 2 models using the `SIGLIP_MODEL` environment variable:
+
+**Available Models:**
+- `google/siglip2-base-patch16-512` (default) - Smaller, faster model
+- `google/siglip2-large-patch16-512` - Larger, more accurate model
+
+**Docker Compose:**
+```yaml
+# In docker-compose.yml, uncomment and set:
+environment:
+  SIGLIP_MODEL: google/siglip2-large-patch16-512
+```
+
+**Docker Run:**
+```bash
+# Use base model (default)
+docker run -p 8001:8001 siglip-api
+
+# Use large model
+docker run -e SIGLIP_MODEL=google/siglip2-large-patch16-512 -p 8001:8001 siglip-api
+```
+
+**Local Development:**
+```bash
+# Use large model
+export SIGLIP_MODEL=google/siglip2-large-patch16-512
+uvicorn app:app --host 0.0.0.0 --port 8001 --reload
+```
 
 ### Environment Variables
 
+- `SIGLIP_MODEL`: Model to use (default: `google/siglip2-base-patch16-512`)
 - `LOG_LEVEL`: Logging level (default: INFO)
+- `SIGLIP_VERBOSE_OUTPUT`: Enable verbose debug logging (default: true)
 - `CUDA_VISIBLE_DEVICES`: GPU device ID for CUDA acceleration
 
 ### Docker Compose Volumes
@@ -352,9 +385,22 @@ docker run --rm --gpus all nvidia/cuda:11.8.0-base-ubuntu22.04 nvidia-smi
 
 ## 📊 Model Information
 
-- **Model**: SigLIP 2 large patch16 512
+### Base Model (Default)
+- **Model**: `google/siglip2-base-patch16-512`
+- **Parameters**: ~400M
+- **Embedding Dimension**: 768
+- **Speed**: Faster inference
+- **Memory**: Lower memory usage
+
+### Large Model
+- **Model**: `google/siglip2-large-patch16-512`
 - **Parameters**: ~1.1B
-- **Embedding Dimension**: 1152
+- **Embedding Dimension**: 1152 (estimated)
+- **Speed**: Slower inference
+- **Memory**: Higher memory usage
+- **Accuracy**: Better performance
+
+### Common Specifications
 - **Max Text Length**: 64 tokens
 - **Image Resolution**: 512x512
 - **Languages**: Multilingual (best performance on English)
