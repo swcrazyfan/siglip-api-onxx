@@ -1,60 +1,56 @@
-FROM python:3.12-slim
+# Use Python 3.11 slim image for better performance
+FROM python:3.11-slim
 
-# Set environment variables
-ENV PYTHONUNBUFFERED=1
-ENV PYTHONDONTWRITEBYTECODE=1
-ENV HF_HOME=/app/cache
-ENV TRANSFORMERS_CACHE=/app/cache
-ENV PIP_NO_CACHE_DIR=1
-ENV PIP_DISABLE_PIP_VERSION_CHECK=1
-
-# Add labels to link the package to your repository
-LABEL org.opencontainers.image.source=https://github.com/swcrazyfan/siglip-api-onxx
-LABEL org.opencontainers.image.description="SigLIP 2 API with PyTorch"
-
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    git \
-    curl \
-    build-essential \
-    libgomp1 \
-    libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender-dev \
-    && rm -rf /var/lib/apt/lists/* \
-    && apt-get clean
-
-# Create app directory and cache directory
+# Set working directory
 WORKDIR /app
-RUN mkdir -p /app/cache
 
-# Copy requirements first for better caching
+# Install system dependencies for both CPU and GPU scenarios
+RUN apt-get update && apt-get install -y \
+    wget \
+    curl \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first for better Docker layer caching
 COPY requirements.txt .
 
-# Upgrade pip and install Python dependencies
-RUN pip install --upgrade pip setuptools wheel && \
+# Install Python dependencies
+RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY app.py .
-COPY download_model.py .
+COPY test_batch.py .
+COPY BATCH_PROCESSING.md .
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
     chown -R app:app /app
 USER app
 
+# Environment variables with Docker-optimized defaults
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONPATH=/app
+
+# Auto-scaling enabled by default (will detect available resources)
+ENV AUTO_SCALE_WORKERS=true
+ENV CPU_UTILIZATION_FACTOR=0.85
+
+# Image embedding optimized defaults
+ENV BATCH_SIZE=auto
+ENV BATCH_WAIT_TIME_MS=auto
+ENV MAX_QUEUE_SIZE=1000
+
+# Model configuration
+ENV SIGLIP_MODEL=google/siglip2-base-patch16-512
+ENV SIGLIP_VERBOSE_OUTPUT=true
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD curl -f http://localhost:8000/health || exit 1
+
 # Expose port
-EXPOSE 8001
+EXPOSE 8000
 
-# Health check - increased start period since model downloads at startup
-HEALTHCHECK --interval=30s --timeout=30s --start-period=300s --retries=3 \
-    CMD curl -f http://localhost:8001/health || exit 1
-
-# Create startup script to download model then start the application
-RUN echo '#!/bin/bash\necho "Downloading model on startup..."\npython download_model.py\necho "Starting application..."\nexec uvicorn app:app --host 0.0.0.0 --port 8001 --workers 1' > /app/start.sh && \
-    chmod +x /app/start.sh
-
-# Run the startup script
-CMD ["/app/start.sh"]
+# Run the application
+CMD ["python", "-m", "uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]

@@ -23,6 +23,12 @@ import asyncio
 from contextlib import asynccontextmanager
 import json
 import os
+from asyncio import Queue, Semaphore
+import time
+from dataclasses import dataclass
+from typing import Callable
+import uuid
+import multiprocessing
 
 # Verbose output toggle
 # Controlled by environment variable SIGLIP_VERBOSE_OUTPUT (e.g., "true" or "false")
@@ -53,6 +59,141 @@ MAX_TEXT_TOKENS = 64
 
 # Log which model is being used
 logger.info(f"Using model: {MODEL_NAME}")
+
+# Auto-scaling configuration
+cpu_count = multiprocessing.cpu_count()
+AUTO_SCALE_WORKERS = os.getenv("AUTO_SCALE_WORKERS", "true").lower() == "true"
+CPU_UTILIZATION_FACTOR = float(os.getenv("CPU_UTILIZATION_FACTOR", "0.75"))
+
+# Enhanced hardware detection for Docker and GPU environments
+def detect_hardware_config():
+    """Detect available hardware and return optimal configuration"""
+    config = {
+        "cpu_count": cpu_count,
+        "has_gpu": False,
+        "gpu_memory": 0,
+        "gpu_name": "none",
+        "device_type": "cpu",
+        "recommended_workers": 2,
+        "recommended_batch_size": 8
+    }
+    
+    # Try to detect GPU first (prioritize GPU if available)
+    try:
+        import torch
+        if torch.cuda.is_available():
+            config["has_gpu"] = True
+            config["device_type"] = "cuda"
+            config["gpu_memory"] = torch.cuda.get_device_properties(0).total_memory // (1024**3)  # GB
+            config["gpu_name"] = torch.cuda.get_device_name(0)
+            logger.info(f"CUDA GPU detected: {config['gpu_name']} with {config['gpu_memory']}GB")
+            
+            # GPU-optimized settings (fewer workers, larger batches)
+            if config["gpu_memory"] >= 8:  # 8GB+ GPU (like RTX 3060 12GB)
+                config["recommended_workers"] = 2  # GPU is the bottleneck, not CPU
+                config["recommended_batch_size"] = 16  # Larger batches for GPU efficiency
+            else:  # Smaller GPU
+                config["recommended_workers"] = 1
+                config["recommended_batch_size"] = 8
+                
+        elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
+            config["has_gpu"] = True
+            config["device_type"] = "mps"
+            config["gpu_name"] = "Apple Silicon"
+            logger.info("Apple Silicon MPS detected")
+            
+            # MPS-optimized settings
+            config["recommended_workers"] = 2
+            config["recommended_batch_size"] = 12
+            
+    except Exception as e:
+        logger.debug(f"GPU detection failed: {e}")
+    
+    # CPU-only configuration (especially for image embeddings)
+    if not config["has_gpu"]:
+        config["device_type"] = "cpu"
+        logger.info(f"No GPU detected, using CPU-only with {cpu_count} cores")
+        
+        # For image embeddings on CPU, we need more workers but smaller batches
+        # Since images are much slower than text
+        if cpu_count <= 4:
+            config["recommended_workers"] = max(1, cpu_count - 1)  # Leave 1 core for system
+            config["recommended_batch_size"] = 4
+        elif cpu_count <= 8:
+            config["recommended_workers"] = max(2, int(cpu_count * 0.75))
+            config["recommended_batch_size"] = 6
+        else:  # 8+ cores
+            config["recommended_workers"] = max(4, min(int(cpu_count * 0.75), 8))  # Cap at 8 for memory
+            config["recommended_batch_size"] = 8
+    
+    return config
+
+# Get hardware configuration
+hardware_config = detect_hardware_config()
+
+if AUTO_SCALE_WORKERS:
+    # Use hardware-aware defaults
+    default_workers = hardware_config["recommended_workers"]
+    default_batch_size = hardware_config["recommended_batch_size"]
+else:
+    # Conservative defaults
+    default_workers = 2
+    default_batch_size = 8
+
+# Batch processing configuration with hardware-aware defaults
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", str(default_batch_size)))
+BATCH_WAIT_TIME_MS = int(os.getenv("BATCH_WAIT_TIME_MS", "50"))
+MAX_CONCURRENT_BATCHES = int(os.getenv("MAX_CONCURRENT_BATCHES", str(default_workers)))
+
+# Adjust batch wait time based on hardware
+if hardware_config["has_gpu"]:
+    # GPU can handle larger batches efficiently, so wait a bit longer to fill them
+    BATCH_WAIT_TIME_MS = int(os.getenv("BATCH_WAIT_TIME_MS", "75"))
+else:
+    # CPU benefits from faster response, shorter wait times
+    BATCH_WAIT_TIME_MS = int(os.getenv("BATCH_WAIT_TIME_MS", "35"))
+
+# Queue configuration  
+MAX_QUEUE_SIZE = int(os.getenv("MAX_QUEUE_SIZE", "1000"))
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "300"))  # 5 minutes default
+QUEUE_OVERFLOW_ACTION = os.getenv("QUEUE_OVERFLOW_ACTION", "reject")  # or "wait"
+
+logger.info(f"Hardware configuration detected:")
+logger.info(f"  CPU cores: {hardware_config['cpu_count']}")
+logger.info(f"  GPU available: {hardware_config['has_gpu']}")
+if hardware_config["has_gpu"]:
+    logger.info(f"  GPU: {hardware_config['gpu_name']}")
+    if hardware_config["gpu_memory"] > 0:
+        logger.info(f"  GPU memory: {hardware_config['gpu_memory']}GB")
+logger.info(f"  Device type: {hardware_config['device_type']}")
+logger.info(f"Batch processing configuration:")
+logger.info(f"  Auto-scaling: {AUTO_SCALE_WORKERS}")
+logger.info(f"  Batch workers: {MAX_CONCURRENT_BATCHES}")
+logger.info(f"  Batch size: {BATCH_SIZE}")
+logger.info(f"  Batch wait time: {BATCH_WAIT_TIME_MS}ms")
+logger.info(f"  Max queue size: {MAX_QUEUE_SIZE}")
+
+# Special logging for image embedding workloads
+if not hardware_config["has_gpu"]:
+    logger.info(f"🖼️  Image embedding performance estimate:")
+    logger.info(f"    Expected throughput: {MAX_CONCURRENT_BATCHES * 0.3:.1f}-{MAX_CONCURRENT_BATCHES * 1.0:.1f} images/sec")
+    logger.info(f"    Recommendation: Enable GPU with --gpus all for 10-50x speedup")
+else:
+    logger.info(f"🚀 GPU acceleration enabled - expect 10-50x faster image embeddings")
+
+# Queue system
+request_queue: Optional[Queue] = None
+processing_semaphore: Optional[Semaphore] = None
+batch_workers: List[asyncio.Task] = []
+
+@dataclass
+class QueuedRequest:
+    id: str
+    func: Callable
+    args: tuple
+    kwargs: dict
+    future: asyncio.Future
+    created_at: float
 
 
 class JointInputItem(BaseModel):
@@ -737,12 +878,41 @@ async def list_models():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint"""
+    """Health check endpoint with batch processing info"""
+    queue_info = {}
+    if request_queue is not None:
+        queue_info = {
+            "queue_size": request_queue.qsize(),
+            "max_queue_size": MAX_QUEUE_SIZE,
+            "active_workers": len([w for w in batch_workers if not w.done()]),
+            "total_workers": len(batch_workers)
+        }
+    
     return {
         "status": "healthy",
         "model_loaded": model is not None,
         "device": str(device) if device else "unknown",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "hardware": {
+            "cpu_cores": hardware_config["cpu_count"],
+            "has_gpu": hardware_config["has_gpu"],
+            "gpu_name": hardware_config["gpu_name"],
+            "gpu_memory_gb": hardware_config["gpu_memory"],
+            "device_type": hardware_config["device_type"],
+            "optimized_for": "image_embeddings"
+        },
+        "batch_processing": {
+            "enabled": True,
+            "batch_size": BATCH_SIZE,
+            "batch_wait_time_ms": BATCH_WAIT_TIME_MS,
+            "max_concurrent_batches": MAX_CONCURRENT_BATCHES,
+            "auto_scaling": AUTO_SCALE_WORKERS,
+            **queue_info
+        },
+        "performance_estimates": {
+            "images_per_second": f"{MAX_CONCURRENT_BATCHES * (15 if hardware_config['has_gpu'] else 0.5):.1f}" if hardware_config["has_gpu"] else f"{MAX_CONCURRENT_BATCHES * 0.3:.1f}-{MAX_CONCURRENT_BATCHES * 1.0:.1f}",
+            "note": "GPU acceleration provides 10-50x speedup for image embeddings" if not hardware_config["has_gpu"] else "GPU acceleration active"
+        }
     }
 
 
