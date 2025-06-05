@@ -20,8 +20,6 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copy application code
 COPY app.py .
-COPY test_batch.py .
-COPY BATCH_PROCESSING.md .
 
 # Create non-root user for security
 RUN useradd --create-home --shell /bin/bash app && \
